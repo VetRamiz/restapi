@@ -3,13 +3,15 @@ import base64
 import hmac
 import hashlib
 import logging
+from collections import deque
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request, Header, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Request, Header, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import asyncio
 
 # --------------------------------------------------
@@ -18,19 +20,19 @@ import asyncio
 
 load_dotenv()
 
-ACUITY_USER_ID = os.getenv("ACUITY_USER_ID")
-ACUITY_API_KEY = os.getenv("ACUITY_API_KEY")
+ACUITY_USER_ID        = os.getenv("ACUITY_USER_ID")
+ACUITY_API_KEY        = os.getenv("ACUITY_API_KEY")
 ACUITY_WEBHOOK_SECRET = os.getenv("ACUITY_WEBHOOK_SECRET")
 
-CASPIO_BASE_URL = os.getenv("CASPIO_BASE_URL")
-CASPIO_CLIENT_ID = os.getenv("CASPIO_CLIENT_ID")
-CASPIO_CLIENT_SECRET = os.getenv("CASPIO_CLIENT_SECRET")
-CASPIO_TABLE = os.getenv("CASPIO_APPOINTMENTS_TABLE")
+CASPIO_BASE_URL       = os.getenv("CASPIO_BASE_URL")
+CASPIO_CLIENT_ID      = os.getenv("CASPIO_CLIENT_ID")
+CASPIO_CLIENT_SECRET  = os.getenv("CASPIO_CLIENT_SECRET")
+CASPIO_TABLE          = os.getenv("CASPIO_APPOINTMENTS_TABLE")
 
-ACUITY_BASE = "https://acuityscheduling.com/api/v1"
+ACUITY_BASE           = "https://acuityscheduling.com/api/v1"
 
 # --------------------------------------------------
-# LOGGING (PHI SAFE)
+# LOGGING  (PHI SAFE — never log patient names/emails)
 # --------------------------------------------------
 
 logging.basicConfig(level=logging.INFO)
@@ -42,7 +44,8 @@ log = logging.getLogger("acuity-proxy")
 
 app = FastAPI(
     title="Acuity ↔ Caspio Proxy",
-    version="1.0.0"
+    description="Covers all Acuity availability, appointments, and Caspio sync",
+    version="2.0.0"
 )
 
 app.add_middleware(
@@ -56,17 +59,27 @@ app.add_middleware(
 # GLOBAL STATE
 # --------------------------------------------------
 
-recent_webhooks = set()
-_caspio_token_cache = {}
+recent_webhooks       = deque(maxlen=500)   # auto-drops old entries
+_caspio_token_cache   = {}
 
-from pydantic import BaseModel
-from typing import List, Optional
+# --------------------------------------------------
+# PYDANTIC MODELS
+# --------------------------------------------------
 
 class BulkAvailabilityRequest(BaseModel):
     appointmentTypeID: int
     calendarIDs: List[int]
     date: str
     timezone: Optional[str] = "America/New_York"
+
+
+class CheckTimesRequest(BaseModel):
+    appointmentTypeID: int
+    calendarID: Optional[int]  = None
+    datetime: str
+    timezone: Optional[str]    = "America/New_York"
+
+
 # --------------------------------------------------
 # AUTH HELPERS
 # --------------------------------------------------
@@ -75,7 +88,6 @@ def acuity_headers():
     token = base64.b64encode(
         f"{ACUITY_USER_ID}:{ACUITY_API_KEY}".encode()
     ).decode()
-
     return {
         "Authorization": f"Basic {token}",
         "Content-Type": "application/json"
@@ -83,9 +95,7 @@ def acuity_headers():
 
 
 async def get_caspio_token():
-
     now = datetime.utcnow().timestamp()
-
     if (
         _caspio_token_cache.get("token")
         and _caspio_token_cache.get("expires_at", 0) > now + 60
@@ -93,269 +103,561 @@ async def get_caspio_token():
         return _caspio_token_cache["token"]
 
     async with httpx.AsyncClient(timeout=10) as client:
-
         resp = await client.post(
             f"{CASPIO_BASE_URL}/oauth/token",
             data={
-                "grant_type": "client_credentials",
-                "client_id": CASPIO_CLIENT_ID,
+                "grant_type":    "client_credentials",
+                "client_id":     CASPIO_CLIENT_ID,
                 "client_secret": CASPIO_CLIENT_SECRET
             },
             headers={"Content-Type": "application/x-www-form-urlencoded"}
         )
 
     if resp.status_code != 200:
-        log.error("Caspio token request failed")
+        log.error("Caspio token request failed: %s", resp.status_code)
         raise HTTPException(500, "Caspio authentication failed")
 
     data = resp.json()
-
-    _caspio_token_cache["token"] = data["access_token"]
+    _caspio_token_cache["token"]      = data["access_token"]
     _caspio_token_cache["expires_at"] = now + data.get("expires_in", 3600)
-
     return data["access_token"]
 
 
 async def caspio_headers():
-
     token = await get_caspio_token()
-
     return {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json"
     }
 
+
 # --------------------------------------------------
 # SECURITY HELPERS
 # --------------------------------------------------
 
-def verify_acuity_signature(raw_body: bytes, signature: Optional[str]):
-
+def verify_acuity_signature(raw_body: bytes, signature: Optional[str]) -> bool:
+    if not ACUITY_WEBHOOK_SECRET:
+        return True                # skip if secret not configured
     if not signature:
         return False
-
     expected = hmac.new(
         ACUITY_WEBHOOK_SECRET.encode(),
         raw_body,
         hashlib.sha256
     ).hexdigest()
-
     return hmac.compare_digest(expected, signature)
+
 
 # --------------------------------------------------
 # CASPIO SYNC HELPERS
 # --------------------------------------------------
 
 async def caspio_upsert_appointment(appointment: dict):
-
     apt_id = appointment.get("id")
-
     if not apt_id:
         return
 
     headers = await caspio_headers()
 
+    # ★ Adjust left-side keys to match your exact Caspio column names
     record = {
-        "AcuityID": apt_id,
-        "FirstName": appointment.get("firstName", ""),
-        "LastName": appointment.get("lastName", ""),
-        "Email": appointment.get("email", ""),
+        "AcuityID":        apt_id,
+        "FirstName":       appointment.get("firstName", ""),
+        "LastName":        appointment.get("lastName", ""),
+        "Email":           appointment.get("email", ""),
         "AppointmentDate": appointment.get("date", ""),
         "AppointmentTime": appointment.get("time", ""),
-        "CalendarName": appointment.get("calendar", ""),
-        "Status": "Canceled" if appointment.get("canceled") else "Scheduled",
-        "LastUpdated": datetime.utcnow().isoformat()
+        "CalendarName":    appointment.get("calendar", ""),
+        "CalendarID":      appointment.get("calendarID", ""),
+        "AppointmentType": appointment.get("type", ""),
+        "Duration":        appointment.get("duration", ""),
+        "Status":          "Canceled" if appointment.get("canceled") else "Scheduled",
+        "Notes":           appointment.get("notes", ""),
+        "LastUpdated":     datetime.utcnow().isoformat()
     }
 
     async with httpx.AsyncClient(timeout=15) as client:
-
         check = await client.get(
             f"{CASPIO_BASE_URL}/v2/tables/{CASPIO_TABLE}/records",
             headers=headers,
-            params={
-                "q.where": f"AcuityID={apt_id}",
-                "q.limit": 1
-            }
+            params={"q.where": f"AcuityID={apt_id}", "q.limit": 1}
         )
-
         existing = check.json().get("Result", [])
 
         if existing:
-
             await client.put(
                 f"{CASPIO_BASE_URL}/v2/tables/{CASPIO_TABLE}/records",
                 headers=headers,
                 params={"q.where": f"AcuityID={apt_id}"},
                 json=record
             )
-
+            log.info("Caspio updated appointment ID %s", apt_id)
         else:
-
             await client.post(
                 f"{CASPIO_BASE_URL}/v2/tables/{CASPIO_TABLE}/records",
                 headers=headers,
                 json=record
             )
+            log.info("Caspio inserted appointment ID %s", apt_id)
 
-    log.info(f"Appointment {apt_id} synced to Caspio")
+
+async def caspio_mark_canceled(apt_id: int):
+    headers = await caspio_headers()
+    async with httpx.AsyncClient(timeout=15) as client:
+        await client.put(
+            f"{CASPIO_BASE_URL}/v2/tables/{CASPIO_TABLE}/records",
+            headers=headers,
+            params={"q.where": f"AcuityID={apt_id}"},
+            json={
+                "Status":      "Canceled",
+                "LastUpdated": datetime.utcnow().isoformat()
+            }
+        )
+    log.info("Caspio marked appointment ID %s as canceled", apt_id)
+
+
+# ==================================================
+# ROUTES
+# ==================================================
 
 # --------------------------------------------------
-# HEALTH ENDPOINT
+# HEALTH + ROOT
 # --------------------------------------------------
 
-@app.get("/health")
-async def health():
-    return {
-        "status": "ok",
-        "time": datetime.utcnow()
-    }
-
-# --------------------------------------------------
-# ROOT
-# --------------------------------------------------
-
-@app.get("/")
+@app.get("/", tags=["Health"])
 async def root():
     return {"service": "acuity-caspio-proxy", "status": "running"}
 
+
+@app.get("/health", tags=["Health"])
+async def health():
+    return {"status": "ok", "time": datetime.utcnow()}
+
+
 # --------------------------------------------------
-# ACUITY ENDPOINTS
+# CONFIGURATION ENDPOINTS
 # --------------------------------------------------
 
-@app.get("/appointment-types")
-async def get_appointment_types():
+@app.get("/appointment-types", tags=["Configuration"])
+async def get_appointment_types(
+    calendarID: Optional[int] = Query(None, description="Filter by calendar ID")
+):
+    """List all appointment types. IDs from here are used in all availability calls."""
+    params = {}
+    if calendarID:
+        params["calendarID"] = calendarID
 
     async with httpx.AsyncClient(timeout=10) as client:
-
         resp = await client.get(
             f"{ACUITY_BASE}/appointment-types",
-            headers=acuity_headers()
+            headers=acuity_headers(),
+            params=params
         )
-
     if resp.status_code != 200:
-        raise HTTPException(500, "Unable to fetch appointment types")
-
+        raise HTTPException(resp.status_code, "Unable to fetch appointment types")
     return resp.json()
 
+
+@app.get("/calendars", tags=["Configuration"])
+async def get_calendars():
+    """List all therapist calendars with their IDs. Use these IDs in availability calls."""
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(
+            f"{ACUITY_BASE}/calendars",
+            headers=acuity_headers()
+        )
+    if resp.status_code != 200:
+        raise HTTPException(resp.status_code, "Unable to fetch calendars")
+    return resp.json()
+
+
+@app.get("/appointment-addons", tags=["Configuration"])
+async def get_appointment_addons():
+    """List all add-ons available. Use addonIDs when booking appointments."""
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(
+            f"{ACUITY_BASE}/appointment-addons",
+            headers=acuity_headers()
+        )
+    if resp.status_code != 200:
+        raise HTTPException(resp.status_code, "Unable to fetch addons")
+    return resp.json()
+
+
 # --------------------------------------------------
-# BOOK APPOINTMENT
+# AVAILABILITY ENDPOINTS  (all 4 from Acuity docs)
 # --------------------------------------------------
 
-@app.post("/appointments")
-async def create_appointment(body: dict, background_tasks: BackgroundTasks):
+@app.get("/availability/dates", tags=["Availability"])
+async def available_dates(
+    appointmentTypeID: int     = Query(...,  description="Appointment type ID — get from /appointment-types"),
+    month:             str     = Query(None, description="YYYY-MM format. Defaults to current month"),
+    calendarID:        Optional[int] = Query(None, description="Specific therapist calendar ID"),
+    timezone:          str     = Query("America/New_York", description="Timezone string"),
+):
+    """
+    GET available dates for a calendar in a given month.
+    Returns array of { date: YYYY-MM-DD } objects.
+
+    Test in browser:
+    /availability/dates?appointmentTypeID=999&calendarID=111&month=2025-03
+    """
+    if not month:
+        month = datetime.now().strftime("%Y-%m")
+
+    params = {
+        "appointmentTypeID": appointmentTypeID,
+        "month":             month,
+        "timezone":          timezone,
+    }
+    if calendarID:
+        params["calendarID"] = calendarID
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(
+            f"{ACUITY_BASE}/availability/dates",
+            headers=acuity_headers(),
+            params=params
+        )
+    if resp.status_code != 200:
+        raise HTTPException(resp.status_code, resp.text)
+    return resp.json()
+
+
+@app.get("/availability/times", tags=["Availability"])
+async def available_times(
+    appointmentTypeID: int     = Query(..., description="Appointment type ID"),
+    date:              str     = Query(..., description="YYYY-MM-DD format"),
+    calendarID:        Optional[int] = Query(None, description="Specific therapist calendar ID"),
+    timezone:          str     = Query("America/New_York"),
+):
+    """
+    GET available time slots for a specific date.
+    Returns array of { time, slotsAvailable } objects.
+
+    Test in browser:
+    /availability/times?appointmentTypeID=999&calendarID=111&date=2025-03-15
+    """
+    params = {
+        "appointmentTypeID": appointmentTypeID,
+        "date":              date,
+        "timezone":          timezone,
+    }
+    if calendarID:
+        params["calendarID"] = calendarID
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(
+            f"{ACUITY_BASE}/availability/times",
+            headers=acuity_headers(),
+            params=params
+        )
+    if resp.status_code != 200:
+        raise HTTPException(resp.status_code, resp.text)
+    return resp.json()
+
+
+@app.get("/availability/classes", tags=["Availability"])
+async def available_classes(
+    appointmentTypeID:  Optional[int]  = Query(None, description="Filter by appointment type"),
+    calendarID:         Optional[int]  = Query(None, description="Filter by calendar"),
+    month:              Optional[str]  = Query(None, description="YYYY-MM format"),
+    includeUnavailable: bool           = Query(False, description="Include full/unavailable classes"),
+    timezone:           str            = Query("America/New_York"),
+):
+    """
+    GET available class/group session slots.
+    Use this for group therapy sessions.
+
+    Test in browser:
+    /availability/classes?appointmentTypeID=999&month=2025-03
+    """
+    params = {
+        "timezone":          timezone,
+        "includeUnavailable": str(includeUnavailable).lower(),
+    }
+    if appointmentTypeID: params["appointmentTypeID"] = appointmentTypeID
+    if calendarID:        params["calendarID"]        = calendarID
+    if month:             params["month"]             = month
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(
+            f"{ACUITY_BASE}/availability/classes",
+            headers=acuity_headers(),
+            params=params
+        )
+    if resp.status_code != 200:
+        raise HTTPException(resp.status_code, resp.text)
+    return resp.json()
+
+
+@app.post("/availability/check-times", tags=["Availability"])
+async def check_times(body: CheckTimesRequest):
+    """
+    POST to verify a specific datetime slot is still available.
+    Call this RIGHT BEFORE booking to avoid double-booking.
+
+    Body:
+    {
+      "appointmentTypeID": 999,
+      "calendarID": 111,
+      "datetime": "2025-03-15T10:00:00-0500",
+      "timezone": "America/New_York"
+    }
+    """
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.post(
+            f"{ACUITY_BASE}/availability/check-times",
+            headers=acuity_headers(),
+            json=body.model_dump(exclude_none=True)
+        )
+    if resp.status_code != 200:
+        raise HTTPException(resp.status_code, resp.text)
+    return resp.json()
+
+
+@app.post("/availability/bulk", tags=["Availability"])
+async def availability_bulk(body: BulkAvailabilityRequest):
+    """
+    ★ MAIN CASPIO ENDPOINT
+    Fetch available times for MULTIPLE therapist calendars at once.
+    All requests fire in parallel — fast even with 10+ therapists.
+
+    Body:
+    {
+      "appointmentTypeID": 999,
+      "calendarIDs": [111, 222, 333],
+      "date": "2025-03-15",
+      "timezone": "America/New_York"
+    }
+    """
+    async with httpx.AsyncClient(timeout=15) as client:
+        tasks = [
+            client.get(
+                f"{ACUITY_BASE}/availability/times",
+                headers=acuity_headers(),
+                params={
+                    "appointmentTypeID": body.appointmentTypeID,
+                    "calendarID":        calendar_id,
+                    "date":              body.date,
+                    "timezone":          body.timezone
+                }
+            )
+            for calendar_id in body.calendarIDs
+        ]
+        responses = await asyncio.gather(*tasks)
+
+    results = []
+    for i, resp in enumerate(responses):
+        if resp.status_code == 200:
+            results.append({
+                "calendarID": body.calendarIDs[i],
+                "slots":      resp.json()
+            })
+        else:
+            results.append({
+                "calendarID": body.calendarIDs[i],
+                "slots":      [],
+                "error":      "unable to fetch"
+            })
+
+    return {"date": body.date, "results": results}
+
+
+# --------------------------------------------------
+# APPOINTMENTS
+# --------------------------------------------------
+
+@app.get("/appointments", tags=["Appointments"])
+async def get_appointments(
+    minDate:           Optional[str] = Query(None, description="Min date YYYY-MM-DD"),
+    maxDate:           Optional[str] = Query(None, description="Max date YYYY-MM-DD"),
+    calendarID:        Optional[int] = Query(None),
+    appointmentTypeID: Optional[int] = Query(None),
+    canceled:          Optional[bool]= Query(None),
+    max:               int           = Query(50, description="Max records to return"),
+):
+    """List appointments with optional filters."""
+    params: dict = {"max": max}
+    if minDate:            params["minDate"]            = minDate
+    if maxDate:            params["maxDate"]            = maxDate
+    if calendarID:         params["calendarID"]         = calendarID
+    if appointmentTypeID:  params["appointmentTypeID"]  = appointmentTypeID
+    if canceled is not None: params["canceled"]         = str(canceled).lower()
 
     async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.get(
+            f"{ACUITY_BASE}/appointments",
+            headers=acuity_headers(),
+            params=params
+        )
+    if resp.status_code != 200:
+        raise HTTPException(resp.status_code, resp.text)
+    return resp.json()
 
+
+@app.post("/appointments", tags=["Appointments"], status_code=201)
+async def create_appointment(body: dict, background_tasks: BackgroundTasks):
+    """
+    Book a new appointment. Syncs to Caspio automatically in background.
+
+    Minimum body:
+    {
+      "appointmentTypeID": 999,
+      "calendarID": 111,
+      "datetime": "2025-03-15T10:00:00-0500",
+      "firstName": "Jane",
+      "lastName": "Doe",
+      "email": "jane@example.com"
+    }
+    """
+    async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(
             f"{ACUITY_BASE}/appointments",
             headers=acuity_headers(),
             json=body
         )
-
     if resp.status_code not in (200, 201):
-        raise HTTPException(500, "Appointment creation failed")
+        raise HTTPException(resp.status_code, "Appointment creation failed")
 
     appointment = resp.json()
-
     background_tasks.add_task(caspio_upsert_appointment, appointment)
-
     return appointment
 
-@app.post("/availability/bulk")
-async def availability_bulk(body: BulkAvailabilityRequest):
 
-    results = []
-
+@app.get("/appointments/{appointment_id}", tags=["Appointments"])
+async def get_appointment(appointment_id: int):
+    """Get a single appointment by Acuity ID."""
     async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(
+            f"{ACUITY_BASE}/appointments/{appointment_id}",
+            headers=acuity_headers()
+        )
+    if resp.status_code != 200:
+        raise HTTPException(resp.status_code, resp.text)
+    return resp.json()
 
-        tasks = []
 
-        for calendar_id in body.calendarIDs:
+@app.put("/appointments/{appointment_id}/cancel", tags=["Appointments"])
+async def cancel_appointment(
+    appointment_id:  int,
+    background_tasks: BackgroundTasks,
+    noEmail: bool = Query(False, description="Suppress cancellation email")
+):
+    """Cancel an appointment. Updates Caspio Status to Canceled."""
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.put(
+            f"{ACUITY_BASE}/appointments/{appointment_id}/cancel",
+            headers=acuity_headers(),
+            params={"noEmail": str(noEmail).lower()}
+        )
+    if resp.status_code != 200:
+        raise HTTPException(resp.status_code, resp.text)
 
-            params = {
-                "appointmentTypeID": body.appointmentTypeID,
-                "calendarID": calendar_id,
-                "date": body.date,
-                "timezone": body.timezone
-            }
+    background_tasks.add_task(caspio_mark_canceled, appointment_id)
+    return resp.json()
 
-            tasks.append(
-                client.get(
-                    f"{ACUITY_BASE}/availability/times",
-                    headers=acuity_headers(),
-                    params=params
-                )
-            )
 
-        responses = await asyncio.gather(*tasks)
+@app.put("/appointments/{appointment_id}/reschedule", tags=["Appointments"])
+async def reschedule_appointment(
+    appointment_id:   int,
+    body:             dict,
+    background_tasks: BackgroundTasks,
+):
+    """
+    Reschedule to a new datetime. Updates Caspio with new date/time.
 
-        for i, resp in enumerate(responses):
+    Body: { "datetime": "2025-03-20T11:00:00-0500" }
+    """
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.put(
+            f"{ACUITY_BASE}/appointments/{appointment_id}/reschedule",
+            headers=acuity_headers(),
+            json=body
+        )
+    if resp.status_code != 200:
+        raise HTTPException(resp.status_code, resp.text)
 
-            if resp.status_code == 200:
+    appointment = resp.json()
+    background_tasks.add_task(caspio_upsert_appointment, appointment)
+    return appointment
 
-                slots = resp.json()
 
-                results.append({
-                    "calendarID": body.calendarIDs[i],
-                    "slots": slots
-                })
+@app.get("/appointments/{appointment_id}/payments", tags=["Appointments"])
+async def get_appointment_payments(appointment_id: int):
+    """Get payment records for a specific appointment."""
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(
+            f"{ACUITY_BASE}/appointments/{appointment_id}/payments",
+            headers=acuity_headers()
+        )
+    if resp.status_code != 200:
+        raise HTTPException(resp.status_code, resp.text)
+    return resp.json()
 
-            else:
 
-                results.append({
-                    "calendarID": body.calendarIDs[i],
-                    "slots": [],
-                    "error": "unable to fetch"
-                })
-
-    return {"results": results}
 # --------------------------------------------------
-# WEBHOOK (REPLACES ZAPIER)
+# WEBHOOK  (replaces Zapier)
 # --------------------------------------------------
 
-@app.post("/webhooks/acuity")
+@app.post("/webhooks/acuity", tags=["Webhooks"])
 async def acuity_webhook(
-    request: Request,
+    request:          Request,
     background_tasks: BackgroundTasks,
     x_acuity_signature: Optional[str] = Header(None)
 ):
+    """
+    Register this URL in Acuity → Integrations → Webhooks.
+    Handles all events and syncs to Caspio automatically.
 
+    Events handled:
+      scheduling.scheduled   → INSERT into Caspio
+      scheduling.rescheduled → UPDATE in Caspio
+      scheduling.changed     → UPDATE in Caspio
+      scheduling.canceled    → Mark Canceled in Caspio
+      order.completed        → UPDATE in Caspio
+    """
     raw_body = await request.body()
 
     if not verify_acuity_signature(raw_body, x_acuity_signature):
         raise HTTPException(401, "Invalid webhook signature")
 
-    data = await request.json()
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON payload")
 
     action = data.get("action")
     apt_id = data.get("id")
 
-    webhook_id = f"{action}_{apt_id}"
+    if not apt_id:
+        return {"status": "ignored", "reason": "no appointment id"}
 
+    # Deduplicate
+    webhook_id = f"{action}_{apt_id}"
     if webhook_id in recent_webhooks:
         return {"status": "duplicate ignored"}
+    recent_webhooks.append(webhook_id)
 
-    recent_webhooks.add(webhook_id)
+    log.info("Webhook received: action=%s id=%s", action, apt_id)
 
-    if action in [
+    if action == "scheduling.canceled":
+        background_tasks.add_task(caspio_mark_canceled, int(apt_id))
+
+    elif action in (
         "scheduling.scheduled",
         "scheduling.rescheduled",
-        "scheduling.changed"
-    ]:
-
+        "scheduling.changed",
+        "order.completed",
+    ):
         async with httpx.AsyncClient(timeout=10) as client:
-
             resp = await client.get(
                 f"{ACUITY_BASE}/appointments/{apt_id}",
                 headers=acuity_headers()
             )
-
         if resp.status_code == 200:
-            background_tasks.add_task(
-                caspio_upsert_appointment,
-                resp.json()
-            )
+            background_tasks.add_task(caspio_upsert_appointment, resp.json())
+        else:
+            log.error("Failed to fetch appointment %s for webhook sync", apt_id)
 
-    log.info(f"Webhook processed: {action} {apt_id}")
-
-    return {"status": "processed"}
+    return {"status": "processed", "action": action, "id": apt_id}
