@@ -661,3 +661,281 @@ async def acuity_webhook(
             log.error("Failed to fetch appointment %s for webhook sync", apt_id)
 
     return {"status": "processed", "action": action, "id": apt_id}
+
+    import re
+
+# ── Constants ──────────────────────────────────────────────────────────────
+SKIP_CATEGORIES = {
+    "MEETINGS",
+    "SUPERVISION",
+    "INTERVIEW- THRIVE PSYCHOLOGY GROUP",
+    "ONLINE CONNECTION GROUP  (50 Mins)",
+    "TELEPHONE CHECK-IN SESSION (15 MNS)",
+    "TELEPHONE CHECK-IN SESSION (30 MNS)",
+    "THRIVE PHONE APPOINTMENT : 50 MIN SESSION  [FOR EXISTING CLIENTS]",
+    "THRIVE NEW YORK: PHONE SESSION (50 MINS)  [FOR EXISTING CLIENTS]",
+    "THRIVE-  EXISTING CLIENT SESSION ",
+}
+
+EXISTING_CLIENT_KEYWORDS = [
+    "EXISTING CLIENT",
+    "ADHD ASSESSMENTS",
+    "Psychological Evaluation",
+    "PSYCHOLOGICAL EVALUATION",
+    "ADHD",
+    "SUPERVISION",
+    "INTERVIEW",
+]
+
+STATE_KEYWORDS = {
+    "California":     ["CALIFORNIA"],
+    "New York":       ["NEW YORK"],
+    "Connecticut":    ["CONNECTICUT"],
+    "Florida":        ["FLORIDA"],
+    "Georgia":        ["GEORGIA"],
+    "Illinois":       ["ILLINOIS"],
+    "Maine":          ["MAINE"],
+    "North Carolina": ["NORTH CAROLINA"],
+    "Pennsylvania":   ["PENNSYLVANIA"],
+    "Tennessee":      ["TENNESSEE"],
+    "Texas":          ["TEXAS"],
+    "Washington":     ["WASHINGTON"],
+    "Wyoming":        ["WYOMING", "(WY)"],
+    # add more states here as you expand
+}
+
+ALL_STATES_KEYWORDS = ["ALL STATES", "THRIVE ONLINE"]
+
+
+def is_new_client_consultation(apt_type: dict) -> bool:
+    """Returns True if this appointment type is a new-client consultation."""
+    cat = apt_type.get("category", "").upper()
+    name = apt_type.get("name", "").upper()
+
+    # Skip internal categories
+    if apt_type.get("category", "") in SKIP_CATEGORIES:
+        return False
+
+    # Skip existing client / assessment / evaluation types
+    for kw in EXISTING_CLIENT_KEYWORDS:
+        if kw.upper() in cat or kw.upper() in name:
+            return False
+
+    # Must have at least one calendarID to be useful
+    if not apt_type.get("calendarIDs"):
+        return False
+
+    return True
+
+
+def matches_state(apt_type: dict, state: str) -> bool:
+    """Returns True if this appointment type serves the given state."""
+    cat = apt_type.get("category", "").upper()
+    name = apt_type.get("name", "").upper()
+
+    keywords = STATE_KEYWORDS.get(state, [state.upper()])
+    for kw in keywords:
+        if kw.upper() in cat or kw.upper() in name:
+            return True
+    return False
+
+
+def is_all_states(apt_type: dict) -> bool:
+    """Returns True if this appointment type serves all states."""
+    cat = apt_type.get("category", "").upper()
+    for kw in ALL_STATES_KEYWORDS:
+        if kw.upper() in cat:
+            return True
+    return False
+
+
+@app.get("/availability/by-state", tags=["Availability"])
+async def availability_by_state(
+    state:    str = Query(..., description="Full state name e.g. 'California', 'New York'"),
+    date:     str = Query(..., description="YYYY-MM-DD"),
+    timezone: str = Query("America/New_York"),
+):
+    """
+    ★ MAIN CASPIO ENDPOINT — Get available slots for new clients in a state.
+    
+    Example:
+    /availability/by-state?state=California&date=2026-04-10
+    /availability/by-state?state=New York&date=2026-04-10
+    """
+    async with httpx.AsyncClient(timeout=15) as client:
+        types_resp = await client.get(
+            f"{ACUITY_BASE}/appointment-types",
+            headers=acuity_headers()
+        )
+    if types_resp.status_code != 200:
+        raise HTTPException(500, "Could not fetch appointment types")
+
+    all_types = types_resp.json()
+
+    # Step 1: Filter to state-specific new client consultations
+    state_types = [
+        t for t in all_types
+        if is_new_client_consultation(t) and matches_state(t, state)
+    ]
+
+    # Step 2: Also include ALL STATES types as supplemental
+    all_states_types = [
+        t for t in all_types
+        if is_new_client_consultation(t) and is_all_states(t)
+    ]
+
+    matched_types = state_types if state_types else all_states_types
+    # If we have state-specific types, still add all-states as extra coverage
+    if state_types and all_states_types:
+        existing_ids = {t["id"] for t in state_types}
+        for t in all_states_types:
+            if t["id"] not in existing_ids:
+                matched_types.append(t)
+
+    if not matched_types:
+        return {
+            "state": state, "date": date,
+            "message": "No appointment types found for this state",
+            "slots": []
+        }
+
+    # Step 3: Collect unique calendarID → typeID map
+    calendar_type_map = {}
+    for apt_type in matched_types:
+        for cal_id in apt_type.get("calendarIDs", []):
+            if cal_id not in calendar_type_map:
+                calendar_type_map[cal_id] = {
+                    "appointmentTypeID": apt_type["id"],
+                    "schedulingUrl":     apt_type.get("schedulingUrl", ""),
+                    "typeName":          apt_type.get("name", ""),
+                }
+
+    # Step 4: Fetch availability in parallel
+    async with httpx.AsyncClient(timeout=20) as client:
+        cal_ids = list(calendar_type_map.keys())
+        tasks = [
+            client.get(
+                f"{ACUITY_BASE}/availability/times",
+                headers=acuity_headers(),
+                params={
+                    "appointmentTypeID": calendar_type_map[cal_id]["appointmentTypeID"],
+                    "calendarID":        cal_id,
+                    "date":              date,
+                    "timezone":          timezone,
+                }
+            )
+            for cal_id in cal_ids
+        ]
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Step 5: Merge slots
+    all_slots = []
+    for i, resp in enumerate(responses):
+        cal_id = cal_ids[i]
+        info = calendar_type_map[cal_id]
+        if isinstance(resp, Exception) or resp.status_code != 200:
+            continue
+        for slot in resp.json():
+            if slot.get("slotsAvailable", 0) < 1:
+                continue
+            all_slots.append({
+                "time":       slot["time"],
+                "calendarID": cal_id,
+                "bookingUrl": info["schedulingUrl"],
+                "typeID":     info["appointmentTypeID"],
+            })
+
+    all_slots.sort(key=lambda x: x["time"])
+
+    return {
+        "state":          state,
+        "date":           date,
+        "timezone":       timezone,
+        "totalSlots":     len(all_slots),
+        "matchedTypes":   len(matched_types),
+        "totalCalendars": len(calendar_type_map),
+        "slots":          all_slots
+    }
+
+
+@app.get("/availability/dates-by-state", tags=["Availability"])
+async def availability_dates_by_state(
+    state:    str           = Query(..., description="Full state name"),
+    month:    Optional[str] = Query(None, description="YYYY-MM. Defaults to current month"),
+    timezone: str           = Query("America/New_York"),
+):
+    """
+    Get available DATES for new clients in a state for a given month.
+    Caspio calls this first to show date chips to patient.
+    
+    Example:
+    /availability/dates-by-state?state=New York&month=2026-04
+    """
+    if not month:
+        month = datetime.now().strftime("%Y-%m")
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        types_resp = await client.get(
+            f"{ACUITY_BASE}/appointment-types",
+            headers=acuity_headers()
+        )
+    if types_resp.status_code != 200:
+        raise HTTPException(500, "Could not fetch appointment types")
+
+    all_types = types_resp.json()
+
+    state_types = [
+        t for t in all_types
+        if is_new_client_consultation(t) and matches_state(t, state)
+    ]
+    all_states_types = [
+        t for t in all_types
+        if is_new_client_consultation(t) and is_all_states(t)
+    ]
+    matched_types = state_types if state_types else all_states_types
+    if state_types and all_states_types:
+        existing_ids = {t["id"] for t in state_types}
+        for t in all_states_types:
+            if t["id"] not in existing_ids:
+                matched_types.append(t)
+
+    calendar_type_map = {}
+    for apt_type in matched_types:
+        for cal_id in apt_type.get("calendarIDs", []):
+            if cal_id not in calendar_type_map:
+                calendar_type_map[cal_id] = apt_type["id"]
+
+    if not calendar_type_map:
+        return {"state": state, "month": month, "dates": []}
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        cal_ids = list(calendar_type_map.keys())
+        tasks = [
+            client.get(
+                f"{ACUITY_BASE}/availability/dates",
+                headers=acuity_headers(),
+                params={
+                    "appointmentTypeID": calendar_type_map[cal_id],
+                    "calendarID":        cal_id,
+                    "month":             month,
+                    "timezone":          timezone,
+                }
+            )
+            for cal_id in cal_ids
+        ]
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+    all_dates = set()
+    for resp in responses:
+        if isinstance(resp, Exception) or resp.status_code != 200:
+            continue
+        for d in resp.json():
+            if d.get("date"):
+                all_dates.add(d["date"])
+
+    return {
+        "state":    state,
+        "month":    month,
+        "timezone": timezone,
+        "dates":    [{"date": d} for d in sorted(all_dates)]
+    }
