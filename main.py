@@ -701,6 +701,26 @@ STATE_KEYWORDS = {
     "Texas":          ["TEXAS"],
     "Washington":     ["WASHINGTON"],
     "Wyoming":        ["WYOMING", "(WY)"],
+    "Virginia":      ["VIRGINIA"],
+    "Massachusetts": ["MASSACHUSETTS"],
+    "Ohio":          ["OHIO"],
+    "Michigan":     ["MICHIGAN"],
+    "Colorado":     ["COLORADO"],
+    "Arizona":      ["ARIZONA"],
+    "New Jersey":   ["NEW JERSEY"],
+    "Maryland":     ["MARYLAND"],
+    "Wisconsin":    ["WISCONSIN"],
+    "Minnesota":    ["MINNESOTA"],
+    "Indiana":     ["INDIANA"],
+    "Missouri":    ["MISSOURI"],
+    "Oklahoma":    ["OKLAHOMA"],
+    "Louisiana":   ["LOUISIANA"],
+    "Alabama":    ["ALABAMA"],
+    "Kentucky":   ["KENTUCKY"],
+    "South Carolina": ["SOUTH CAROLINA"],
+    "Rhode Island": ["RHODE ISLAND"],
+    "Vermont": ["VERMONT"],
+    
     # add more states here as you expand
 }
 
@@ -748,6 +768,13 @@ def is_all_states(apt_type: dict) -> bool:
             return True
     return False
 
+ALLOWED_TYPE_NAMES = [
+    "50 Minute Online Psychological Evaluation",  # adjust to exact name in Acuity
+]
+
+def is_allowed_type(apt_type: dict) -> bool:
+    name = apt_type.get("name", "").upper()
+    return any(kw in name for kw in ALLOWED_TYPE_NAMES)  # added to book only 50 min evals, adjust as needed
 
 @app.get("/availability/by-state", tags=["Availability"])
 async def availability_by_state(
@@ -775,13 +802,13 @@ async def availability_by_state(
     # Step 1: Filter to state-specific new client consultations
     state_types = [
         t for t in all_types
-        if is_new_client_consultation(t) and matches_state(t, state)
+        if is_allowed_type(t) and matches_state(t, state)
     ]
 
     # Step 2: Also include ALL STATES types as supplemental
     all_states_types = [
         t for t in all_types
-        if is_new_client_consultation(t) and is_all_states(t)
+        if is_allowed_type(t) and is_all_states(t)
     ]
 
     matched_types = state_types if state_types else all_states_types
@@ -886,11 +913,11 @@ async def availability_dates_by_state(
 
     state_types = [
         t for t in all_types
-        if is_new_client_consultation(t) and matches_state(t, state)
+        if is_allowed_type(t) and matches_state(t, state)
     ]
     all_states_types = [
         t for t in all_types
-        if is_new_client_consultation(t) and is_all_states(t)
+        if is_allowed_type(t) and is_all_states(t)
     ]
     matched_types = state_types if state_types else all_states_types
     if state_types and all_states_types:
