@@ -45,7 +45,7 @@ log = logging.getLogger("acuity-proxy")
 app = FastAPI(
     title="Acuity ↔ Caspio Proxy",
     description="Covers all Acuity availability, appointments, and Caspio sync",
-    version="2.0.0"
+    version="2.1.0"
 )
 
 app.add_middleware(
@@ -59,8 +59,8 @@ app.add_middleware(
 # GLOBAL STATE
 # --------------------------------------------------
 
-recent_webhooks       = deque(maxlen=500)   # auto-drops old entries
-_caspio_token_cache   = {}
+recent_webhooks     = deque(maxlen=500)   # auto-drops old entries
+_caspio_token_cache = {}
 
 # --------------------------------------------------
 # PYDANTIC MODELS
@@ -149,6 +149,23 @@ def verify_acuity_signature(raw_body: bytes, signature: Optional[str]) -> bool:
 
 
 # --------------------------------------------------
+# REFERRAL ID HELPER
+# --------------------------------------------------
+
+def extract_referral_id(appointment: dict) -> str:
+    """
+    Parse referral_id from Acuity appointment custom form fields.
+    Acuity returns forms as: appointment["forms"] = [{ "values": [{ "name": "...", "value": "..." }] }]
+    Make sure your Acuity form field is named exactly "referral_id".
+    """
+    for form in appointment.get("forms", []):
+        for field in form.get("values", []):
+            if field.get("name", "").lower() == "referral_id":
+                return field.get("value", "")
+    return ""
+
+
+# --------------------------------------------------
 # CASPIO SYNC HELPERS
 # --------------------------------------------------
 
@@ -173,6 +190,7 @@ async def caspio_upsert_appointment(appointment: dict):
         "Duration":        appointment.get("duration", ""),
         "Status":          "Canceled" if appointment.get("canceled") else "Scheduled",
         "Notes":           appointment.get("notes", ""),
+        "ReferralID":      extract_referral_id(appointment),   # ★ referral_id from Acuity form
         "LastUpdated":     datetime.utcnow().isoformat()
     }
 
@@ -242,7 +260,7 @@ async def health():
 async def get_appointment_types(
     calendarID: Optional[int] = Query(None, description="Filter by calendar ID")
 ):
-    """List all appointment types. IDs from here are used in all availability calls."""
+    """List all appointment types (raw passthrough from Acuity — no filtering applied here)."""
     params = {}
     if calendarID:
         params["calendarID"] = calendarID
@@ -285,22 +303,19 @@ async def get_appointment_addons():
 
 
 # --------------------------------------------------
-# AVAILABILITY ENDPOINTS  (all 4 from Acuity docs)
+# AVAILABILITY ENDPOINTS
 # --------------------------------------------------
 
 @app.get("/availability/dates", tags=["Availability"])
 async def available_dates(
-    appointmentTypeID: int     = Query(...,  description="Appointment type ID — get from /appointment-types"),
-    month:             str     = Query(None, description="YYYY-MM format. Defaults to current month"),
+    appointmentTypeID: int           = Query(...,  description="Appointment type ID — get from /appointment-types"),
+    month:             str           = Query(None, description="YYYY-MM format. Defaults to current month"),
     calendarID:        Optional[int] = Query(None, description="Specific therapist calendar ID"),
-    timezone:          str     = Query("America/New_York", description="Timezone string"),
+    timezone:          str           = Query("America/New_York", description="Timezone string"),
 ):
     """
     GET available dates for a calendar in a given month.
     Returns array of { date: YYYY-MM-DD } objects.
-
-    Test in browser:
-    /availability/dates?appointmentTypeID=999&calendarID=111&month=2025-03
     """
     if not month:
         month = datetime.now().strftime("%Y-%m")
@@ -326,17 +341,14 @@ async def available_dates(
 
 @app.get("/availability/times", tags=["Availability"])
 async def available_times(
-    appointmentTypeID: int     = Query(..., description="Appointment type ID"),
-    date:              str     = Query(..., description="YYYY-MM-DD format"),
+    appointmentTypeID: int           = Query(..., description="Appointment type ID"),
+    date:              str           = Query(..., description="YYYY-MM-DD format"),
     calendarID:        Optional[int] = Query(None, description="Specific therapist calendar ID"),
-    timezone:          str     = Query("America/New_York"),
+    timezone:          str           = Query("America/New_York"),
 ):
     """
     GET available time slots for a specific date.
     Returns array of { time, slotsAvailable } objects.
-
-    Test in browser:
-    /availability/times?appointmentTypeID=999&calendarID=111&date=2025-03-15
     """
     params = {
         "appointmentTypeID": appointmentTypeID,
@@ -359,21 +371,15 @@ async def available_times(
 
 @app.get("/availability/classes", tags=["Availability"])
 async def available_classes(
-    appointmentTypeID:  Optional[int]  = Query(None, description="Filter by appointment type"),
-    calendarID:         Optional[int]  = Query(None, description="Filter by calendar"),
-    month:              Optional[str]  = Query(None, description="YYYY-MM format"),
-    includeUnavailable: bool           = Query(False, description="Include full/unavailable classes"),
-    timezone:           str            = Query("America/New_York"),
+    appointmentTypeID:  Optional[int] = Query(None, description="Filter by appointment type"),
+    calendarID:         Optional[int] = Query(None, description="Filter by calendar"),
+    month:              Optional[str] = Query(None, description="YYYY-MM format"),
+    includeUnavailable: bool          = Query(False, description="Include full/unavailable classes"),
+    timezone:           str           = Query("America/New_York"),
 ):
-    """
-    GET available class/group session slots.
-    Use this for group therapy sessions.
-
-    Test in browser:
-    /availability/classes?appointmentTypeID=999&month=2025-03
-    """
+    """GET available class/group session slots."""
     params = {
-        "timezone":          timezone,
+        "timezone":           timezone,
         "includeUnavailable": str(includeUnavailable).lower(),
     }
     if appointmentTypeID: params["appointmentTypeID"] = appointmentTypeID
@@ -396,14 +402,6 @@ async def check_times(body: CheckTimesRequest):
     """
     POST to verify a specific datetime slot is still available.
     Call this RIGHT BEFORE booking to avoid double-booking.
-
-    Body:
-    {
-      "appointmentTypeID": 999,
-      "calendarID": 111,
-      "datetime": "2025-03-15T10:00:00-0500",
-      "timezone": "America/New_York"
-    }
     """
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.post(
@@ -419,17 +417,8 @@ async def check_times(body: CheckTimesRequest):
 @app.post("/availability/bulk", tags=["Availability"])
 async def availability_bulk(body: BulkAvailabilityRequest):
     """
-    ★ MAIN CASPIO ENDPOINT
     Fetch available times for MULTIPLE therapist calendars at once.
     All requests fire in parallel — fast even with 10+ therapists.
-
-    Body:
-    {
-      "appointmentTypeID": 999,
-      "calendarIDs": [111, 222, 333],
-      "date": "2025-03-15",
-      "timezone": "America/New_York"
-    }
     """
     async with httpx.AsyncClient(timeout=15) as client:
         tasks = [
@@ -470,20 +459,20 @@ async def availability_bulk(body: BulkAvailabilityRequest):
 
 @app.get("/appointments", tags=["Appointments"])
 async def get_appointments(
-    minDate:           Optional[str] = Query(None, description="Min date YYYY-MM-DD"),
-    maxDate:           Optional[str] = Query(None, description="Max date YYYY-MM-DD"),
-    calendarID:        Optional[int] = Query(None),
-    appointmentTypeID: Optional[int] = Query(None),
-    canceled:          Optional[bool]= Query(None),
-    max:               int           = Query(50, description="Max records to return"),
+    minDate:           Optional[str]  = Query(None, description="Min date YYYY-MM-DD"),
+    maxDate:           Optional[str]  = Query(None, description="Max date YYYY-MM-DD"),
+    calendarID:        Optional[int]  = Query(None),
+    appointmentTypeID: Optional[int]  = Query(None),
+    canceled:          Optional[bool] = Query(None),
+    max:               int            = Query(50, description="Max records to return"),
 ):
     """List appointments with optional filters."""
     params: dict = {"max": max}
-    if minDate:            params["minDate"]            = minDate
-    if maxDate:            params["maxDate"]            = maxDate
-    if calendarID:         params["calendarID"]         = calendarID
-    if appointmentTypeID:  params["appointmentTypeID"]  = appointmentTypeID
-    if canceled is not None: params["canceled"]         = str(canceled).lower()
+    if minDate:              params["minDate"]            = minDate
+    if maxDate:              params["maxDate"]            = maxDate
+    if calendarID:           params["calendarID"]         = calendarID
+    if appointmentTypeID:    params["appointmentTypeID"]  = appointmentTypeID
+    if canceled is not None: params["canceled"]           = str(canceled).lower()
 
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.get(
@@ -500,16 +489,21 @@ async def get_appointments(
 async def create_appointment(body: dict, background_tasks: BackgroundTasks):
     """
     Book a new appointment. Syncs to Caspio automatically in background.
+    Pass referral_id in the fields array to track it through to Caspio:
 
-    Minimum body:
     {
       "appointmentTypeID": 999,
       "calendarID": 111,
       "datetime": "2025-03-15T10:00:00-0500",
       "firstName": "Jane",
       "lastName": "Doe",
-      "email": "jane@example.com"
+      "email": "jane@example.com",
+      "fields": [
+        { "id": "YOUR_ACUITY_FIELD_ID", "value": "REF-12345" }
+      ]
     }
+
+    Get YOUR_ACUITY_FIELD_ID from GET /forms on the Acuity API.
     """
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(
@@ -540,7 +534,7 @@ async def get_appointment(appointment_id: int):
 
 @app.put("/appointments/{appointment_id}/cancel", tags=["Appointments"])
 async def cancel_appointment(
-    appointment_id:  int,
+    appointment_id:   int,
     background_tasks: BackgroundTasks,
     noEmail: bool = Query(False, description="Suppress cancellation email")
 ):
@@ -566,7 +560,6 @@ async def reschedule_appointment(
 ):
     """
     Reschedule to a new datetime. Updates Caspio with new date/time.
-
     Body: { "datetime": "2025-03-20T11:00:00-0500" }
     """
     async with httpx.AsyncClient(timeout=10) as client:
@@ -602,8 +595,8 @@ async def get_appointment_payments(appointment_id: int):
 
 @app.post("/webhooks/acuity", tags=["Webhooks"])
 async def acuity_webhook(
-    request:          Request,
-    background_tasks: BackgroundTasks,
+    request:            Request,
+    background_tasks:   BackgroundTasks,
     x_acuity_signature: Optional[str] = Header(None)
 ):
     """
@@ -611,7 +604,7 @@ async def acuity_webhook(
     Handles all events and syncs to Caspio automatically.
 
     Events handled:
-      scheduling.scheduled   → INSERT into Caspio
+      scheduling.scheduled   → INSERT into Caspio (with referral_id)
       scheduling.rescheduled → UPDATE in Caspio
       scheduling.changed     → UPDATE in Caspio
       scheduling.canceled    → Mark Canceled in Caspio
@@ -650,6 +643,7 @@ async def acuity_webhook(
         "scheduling.changed",
         "order.completed",
     ):
+        # Fetch full appointment so we get forms[] with referral_id
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
                 f"{ACUITY_BASE}/appointments/{apt_id}",
@@ -662,30 +656,18 @@ async def acuity_webhook(
 
     return {"status": "processed", "action": action, "id": apt_id}
 
-    import re
 
-# ── Constants ──────────────────────────────────────────────────────────────
-SKIP_CATEGORIES = {
-    "MEETINGS",
-    "SUPERVISION",
-    "INTERVIEW- THRIVE PSYCHOLOGY GROUP",
-    "ONLINE CONNECTION GROUP  (50 Mins)",
-    "TELEPHONE CHECK-IN SESSION (15 MNS)",
-    "TELEPHONE CHECK-IN SESSION (30 MNS)",
-    "THRIVE PHONE APPOINTMENT : 50 MIN SESSION  [FOR EXISTING CLIENTS]",
-    "THRIVE NEW YORK: PHONE SESSION (50 MINS)  [FOR EXISTING CLIENTS]",
-    "THRIVE-  EXISTING CLIENT SESSION ",
-}
+# ==================================================
+# FILTERING CONSTANTS  (50-min Psych Eval only)
+# ==================================================
 
-EXISTING_CLIENT_KEYWORDS = [
-    "EXISTING CLIENT",
-    "ADHD ASSESSMENTS",
-    "Psychological Evaluation",
-    "PSYCHOLOGICAL EVALUATION",
-    "ADHD",
-    "SUPERVISION",
-    "INTERVIEW",
-]
+# Matches category strings like:
+#   "THRIVE CALIFORNIA: Psychological Evaluation"
+#   "THRIVE NEW YORK: PSYCHOLOGICAL EVALUATION"
+PSYCH_EVAL_CATEGORY_KEYWORD = "PSYCHOLOGICAL EVALUATION"
+
+# Only 50-minute evaluations
+ALLOWED_DURATION = 50
 
 STATE_KEYWORDS = {
     "California":     ["CALIFORNIA"],
@@ -701,47 +683,51 @@ STATE_KEYWORDS = {
     "Texas":          ["TEXAS"],
     "Washington":     ["WASHINGTON"],
     "Wyoming":        ["WYOMING", "(WY)"],
-    "Virginia":      ["VIRGINIA"],
-    "Massachusetts": ["MASSACHUSETTS"],
-    "Ohio":          ["OHIO"],
-    "Michigan":     ["MICHIGAN"],
-    "Colorado":     ["COLORADO"],
-    "Arizona":      ["ARIZONA"],
-    "New Jersey":   ["NEW JERSEY"],
-    "Maryland":     ["MARYLAND"],
-    "Wisconsin":    ["WISCONSIN"],
-    "Minnesota":    ["MINNESOTA"],
-    "Indiana":     ["INDIANA"],
-    "Missouri":    ["MISSOURI"],
-    "Oklahoma":    ["OKLAHOMA"],
-    "Louisiana":   ["LOUISIANA"],
-    "Alabama":    ["ALABAMA"],
-    "Kentucky":   ["KENTUCKY"],
+    "Virginia":       ["VIRGINIA"],
+    "Massachusetts":  ["MASSACHUSETTS"],
+    "Ohio":           ["OHIO"],
+    "Michigan":       ["MICHIGAN"],
+    "Colorado":       ["COLORADO"],
+    "Arizona":        ["ARIZONA"],
+    "New Jersey":     ["NEW JERSEY"],
+    "Maryland":       ["MARYLAND"],
+    "Wisconsin":      ["WISCONSIN"],
+    "Minnesota":      ["MINNESOTA"],
+    "Indiana":        ["INDIANA"],
+    "Missouri":       ["MISSOURI"],
+    "Oklahoma":       ["OKLAHOMA"],
+    "Louisiana":      ["LOUISIANA"],
+    "Alabama":        ["ALABAMA"],
+    "Kentucky":       ["KENTUCKY"],
     "South Carolina": ["SOUTH CAROLINA"],
-    "Rhode Island": ["RHODE ISLAND"],
-    "Vermont": ["VERMONT"],
-    
-    # add more states here as you expand
+    "Rhode Island":   ["RHODE ISLAND"],
+    "Vermont":        ["VERMONT"],
 }
 
 ALL_STATES_KEYWORDS = ["ALL STATES", "THRIVE ONLINE"]
 
 
-def is_new_client_consultation(apt_type: dict) -> bool:
-    """Returns True if this appointment type is a new-client consultation."""
-    cat = apt_type.get("category", "").upper()
-    name = apt_type.get("name", "").upper()
+def is_50min_psych_eval(apt_type: dict) -> bool:
+    """
+    Returns True only for 50-minute Online Psychological Evaluations.
 
-    # Skip internal categories
-    if apt_type.get("category", "") in SKIP_CATEGORIES:
+    Rules:
+      - category must contain "PSYCHOLOGICAL EVALUATION"
+      - duration must be exactly 50 minutes
+      - must have at least one calendarID assigned (inactive/unassigned types are skipped)
+
+    This approach is robust: new doctors added in Acuity are picked up automatically
+    without any code changes, as long as they follow the same category naming pattern.
+    """
+    category = apt_type.get("category", "").upper()
+    duration  = apt_type.get("duration")
+
+    if PSYCH_EVAL_CATEGORY_KEYWORD not in category:
         return False
 
-    # Skip existing client / assessment / evaluation types
-    for kw in EXISTING_CLIENT_KEYWORDS:
-        if kw.upper() in cat or kw.upper() in name:
-            return False
+    if duration != ALLOWED_DURATION:
+        return False
 
-    # Must have at least one calendarID to be useful
     if not apt_type.get("calendarIDs"):
         return False
 
@@ -750,7 +736,7 @@ def is_new_client_consultation(apt_type: dict) -> bool:
 
 def matches_state(apt_type: dict, state: str) -> bool:
     """Returns True if this appointment type serves the given state."""
-    cat = apt_type.get("category", "").upper()
+    cat  = apt_type.get("category", "").upper()
     name = apt_type.get("name", "").upper()
 
     keywords = STATE_KEYWORDS.get(state, [state.upper()])
@@ -768,13 +754,10 @@ def is_all_states(apt_type: dict) -> bool:
             return True
     return False
 
-ALLOWED_TYPE_NAMES = [
-    "50 Minute Online Psychological Evaluation",  # adjust to exact name in Acuity
-]
 
-def is_allowed_type(apt_type: dict) -> bool:
-    name = apt_type.get("name", "").upper()
-    return any(kw in name for kw in ALLOWED_TYPE_NAMES)  # added to book only 50 min evals, adjust as needed
+# ==================================================
+# STATE-BASED AVAILABILITY ROUTES
+# ==================================================
 
 @app.get("/availability/by-state", tags=["Availability"])
 async def availability_by_state(
@@ -783,11 +766,16 @@ async def availability_by_state(
     timezone: str = Query("America/New_York"),
 ):
     """
-    ★ MAIN CASPIO ENDPOINT — Get available slots for new clients in a state.
-    
+    ★ MAIN CASPIO ENDPOINT — Get available 50-min Psych Eval slots for a state.
+
+    Only returns appointment types that are:
+      - In a "Psychological Evaluation" category
+      - Exactly 50 minutes duration
+      - Have at least one calendar assigned
+
     Example:
-    /availability/by-state?state=California&date=2026-04-10
-    /availability/by-state?state=New York&date=2026-04-10
+      /availability/by-state?state=California&date=2026-04-10
+      /availability/by-state?state=New York&date=2026-04-10
     """
     async with httpx.AsyncClient(timeout=15) as client:
         types_resp = await client.get(
@@ -799,20 +787,19 @@ async def availability_by_state(
 
     all_types = types_resp.json()
 
-    # Step 1: Filter to state-specific new client consultations
+    # State-specific 50-min psych eval types
     state_types = [
         t for t in all_types
-        if is_allowed_type(t) and matches_state(t, state)
+        if is_50min_psych_eval(t) and matches_state(t, state)
     ]
 
-    # Step 2: Also include ALL STATES types as supplemental
+    # All-states / Thrive Online as supplemental coverage
     all_states_types = [
         t for t in all_types
-        if is_allowed_type(t) and is_all_states(t)
+        if is_50min_psych_eval(t) and is_all_states(t)
     ]
 
     matched_types = state_types if state_types else all_states_types
-    # If we have state-specific types, still add all-states as extra coverage
     if state_types and all_states_types:
         existing_ids = {t["id"] for t in state_types}
         for t in all_states_types:
@@ -821,12 +808,13 @@ async def availability_by_state(
 
     if not matched_types:
         return {
-            "state": state, "date": date,
-            "message": "No appointment types found for this state",
-            "slots": []
+            "state":   state,
+            "date":    date,
+            "message": "No 50-minute Psychological Evaluation types found for this state",
+            "slots":   []
         }
 
-    # Step 3: Collect unique calendarID → typeID map
+    # Build calendarID → type info map (first-seen wins per calendar)
     calendar_type_map = {}
     for apt_type in matched_types:
         for cal_id in apt_type.get("calendarIDs", []):
@@ -837,7 +825,7 @@ async def availability_by_state(
                     "typeName":          apt_type.get("name", ""),
                 }
 
-    # Step 4: Fetch availability in parallel
+    # Fetch availability for all calendars in parallel
     async with httpx.AsyncClient(timeout=20) as client:
         cal_ids = list(calendar_type_map.keys())
         tasks = [
@@ -855,11 +843,11 @@ async def availability_by_state(
         ]
         responses = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Step 5: Merge slots
+    # Merge and sort slots
     all_slots = []
     for i, resp in enumerate(responses):
         cal_id = cal_ids[i]
-        info = calendar_type_map[cal_id]
+        info   = calendar_type_map[cal_id]
         if isinstance(resp, Exception) or resp.status_code != 200:
             continue
         for slot in resp.json():
@@ -870,6 +858,7 @@ async def availability_by_state(
                 "calendarID": cal_id,
                 "bookingUrl": info["schedulingUrl"],
                 "typeID":     info["appointmentTypeID"],
+                "typeName":   info["typeName"],
             })
 
     all_slots.sort(key=lambda x: x["time"])
@@ -892,11 +881,12 @@ async def availability_dates_by_state(
     timezone: str           = Query("America/New_York"),
 ):
     """
-    Get available DATES for new clients in a state for a given month.
-    Caspio calls this first to show date chips to patient.
-    
+    Get available DATES for 50-min Psych Evals in a state for a given month.
+    Caspio calls this first to show date chips to the patient.
+
     Example:
-    /availability/dates-by-state?state=New York&month=2026-04
+      /availability/dates-by-state?state=New York&month=2026-04
+      /availability/dates-by-state?state=California&month=2026-04
     """
     if not month:
         month = datetime.now().strftime("%Y-%m")
@@ -913,12 +903,13 @@ async def availability_dates_by_state(
 
     state_types = [
         t for t in all_types
-        if is_allowed_type(t) and matches_state(t, state)
+        if is_50min_psych_eval(t) and matches_state(t, state)
     ]
     all_states_types = [
         t for t in all_types
-        if is_allowed_type(t) and is_all_states(t)
+        if is_50min_psych_eval(t) and is_all_states(t)
     ]
+
     matched_types = state_types if state_types else all_states_types
     if state_types and all_states_types:
         existing_ids = {t["id"] for t in state_types}
@@ -952,7 +943,7 @@ async def availability_dates_by_state(
         ]
         responses = await asyncio.gather(*tasks, return_exceptions=True)
 
-    all_dates = set()
+    all_dates: set = set()
     for resp in responses:
         if isinstance(resp, Exception) or resp.status_code != 200:
             continue
