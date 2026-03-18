@@ -173,9 +173,17 @@ def extract_referral_id(appointment: dict) -> str:
 async def caspio_upsert_appointment(appointment: dict):
     apt_id = appointment.get("id")
     if not apt_id:
+        log.error("No appointment ID found in payload")
         return
 
-    headers = await caspio_headers()
+    log.info("Starting Caspio upsert for appointment ID %s", apt_id)
+
+    try:
+        headers = await caspio_headers()
+        log.info("Caspio token obtained OK")
+    except Exception as e:
+        log.error("Caspio token failed: %s", e)
+        return
 
     record = {
         "appointment_id":                  str(apt_id),
@@ -208,29 +216,36 @@ async def caspio_upsert_appointment(appointment: dict):
     }
 
     async with httpx.AsyncClient(timeout=15) as client:
-        # ✅ CASPIO_API_BASE_URL everywhere, appointment_id in q.where
-        check = await client.get(
-            f"{CASPIO_API_BASE_URL}/v2/tables/{CASPIO_TABLE}/records",
-            headers=headers,
-            params={"q.where": f"appointment_id={apt_id}", "q.limit": 1}
-        )
-        existing = check.json().get("Result", [])
+        try:
+            check = await client.get(
+                f"{CASPIO_API_BASE_URL}/v2/tables/{CASPIO_TABLE}/records",
+                headers=headers,
+                params={"q.where": f"appointment_id={apt_id}", "q.limit": 1}
+            )
+            log.info("Caspio check status: %s body: %s", check.status_code, check.text[:200])
+            existing = check.json().get("Result", [])
+        except Exception as e:
+            log.error("Caspio check failed: %s", e)
+            return
 
-        if existing:
-            await client.put(
-                f"{CASPIO_API_BASE_URL}/v2/tables/{CASPIO_TABLE}/records",
-                headers=headers,
-                params={"q.where": f"appointment_id={apt_id}"},
-                json=record
-            )
-            log.info("Caspio updated appointment ID %s", apt_id)
-        else:
-            await client.post(
-                f"{CASPIO_API_BASE_URL}/v2/tables/{CASPIO_TABLE}/records",
-                headers=headers,
-                json=record
-            )
-            log.info("Caspio inserted appointment ID %s", apt_id)
+        try:
+            if existing:
+                resp = await client.put(
+                    f"{CASPIO_API_BASE_URL}/v2/tables/{CASPIO_TABLE}/records",
+                    headers=headers,
+                    params={"q.where": f"appointment_id={apt_id}"},
+                    json=record
+                )
+                log.info("Caspio PUT status: %s body: %s", resp.status_code, resp.text[:200])
+            else:
+                resp = await client.post(
+                    f"{CASPIO_API_BASE_URL}/v2/tables/{CASPIO_TABLE}/records",
+                    headers=headers,
+                    json=record
+                )
+                log.info("Caspio POST status: %s body: %s", resp.status_code, resp.text[:200])
+        except Exception as e:
+            log.error("Caspio write failed: %s", e)
 
 
 async def caspio_mark_canceled(apt_id: int):
