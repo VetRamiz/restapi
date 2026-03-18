@@ -24,7 +24,8 @@ ACUITY_USER_ID        = os.getenv("ACUITY_USER_ID")
 ACUITY_API_KEY        = os.getenv("ACUITY_API_KEY")
 ACUITY_WEBHOOK_SECRET = os.getenv("ACUITY_WEBHOOK_SECRET")
 
-CASPIO_BASE_URL       = os.getenv("CASPIO_BASE_URL")
+CASPIO_BASE_URL       = os.getenv("CASPIO_BASE_URL")       # for token
+CASPIO_API_BASE_URL   = os.getenv("CASPIO_API_BASE_URL")   # for records
 CASPIO_CLIENT_ID      = os.getenv("CASPIO_CLIENT_ID")
 CASPIO_CLIENT_SECRET  = os.getenv("CASPIO_CLIENT_SECRET")
 CASPIO_TABLE          = os.getenv("CASPIO_APPOINTMENTS_TABLE")
@@ -196,7 +197,7 @@ async def caspio_upsert_appointment(appointment: dict):
 
     async with httpx.AsyncClient(timeout=15) as client:
         check = await client.get(
-            f"{CASPIO_BASE_URL}/v2/tables/{CASPIO_TABLE}/records",
+            f"{CASPIO_API_BASE_URL}/v2/tables/{CASPIO_TABLE}/records",
             headers=headers,
             params={"q.where": f"AcuityID={apt_id}", "q.limit": 1}
         )
@@ -223,7 +224,7 @@ async def caspio_mark_canceled(apt_id: int):
     headers = await caspio_headers()
     async with httpx.AsyncClient(timeout=15) as client:
         await client.put(
-            f"{CASPIO_BASE_URL}/v2/tables/{CASPIO_TABLE}/records",
+            f"{CASPIO_API_BASE_URL}/v2/tables/{CASPIO_TABLE}/records",
             headers=headers,
             params={"q.where": f"AcuityID={apt_id}"},
             json={
@@ -967,7 +968,7 @@ async def test_caspio():
         headers = await caspio_headers()
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
-                f"{CASPIO_BASE_URL}/v2/tables/{CASPIO_TABLE}/records",
+                f"{CASPIO_API_BASE_URL}/v2/tables/{CASPIO_TABLE}/records",
                 headers=headers,
                 params={"q.limit": 1}
             )
