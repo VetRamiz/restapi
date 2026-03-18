@@ -6,7 +6,6 @@ import logging
 from collections import deque
 from datetime import datetime
 import random
-from random import random
 from typing import Optional, List
 
 import httpx
