@@ -5,6 +5,8 @@ import hashlib
 import logging
 from collections import deque
 from datetime import datetime
+import random
+from random import random
 from typing import Optional, List
 
 import httpx
@@ -788,7 +790,14 @@ def is_all_states(apt_type: dict) -> bool:
 # ==================================================
 # STATE-BASED AVAILABILITY ROUTES
 # ==================================================
-
+def extract_doctor_name(type_name: str) -> str:
+    """Extract doctor name from appointment type name.
+    e.g. 'Thrive Santa Monica: 50 Minute Online Psychological Evaluation with Dr. Tamara Rumburg'
+    → 'Dr. Tamara Rumburg'
+    """
+    if " with " in type_name:
+        return type_name.split(" with ")[-1].strip()
+    return type_name
 @app.get("/availability/by-state", tags=["Availability"])
 async def availability_by_state(
     state:    str = Query(..., description="Full state name e.g. 'California', 'New York'"),
@@ -873,7 +882,9 @@ async def availability_by_state(
         ]
         responses = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Merge and sort slots
+    import random
+
+    # Step 5: Merge slots
     all_slots = []
     for i, resp in enumerate(responses):
         cal_id = cal_ids[i]
@@ -884,13 +895,17 @@ async def availability_by_state(
             if slot.get("slotsAvailable", 0) < 1:
                 continue
             all_slots.append({
-                "time":       slot["time"],
-                "calendarID": cal_id,
-                "bookingUrl": info["schedulingUrl"],
-                "typeID":     info["appointmentTypeID"],
-                "typeName":   info["typeName"],
+                "time":          slot["time"],
+                "calendarID":    cal_id,
+                "bookingUrl":    info["schedulingUrl"],
+                "typeID":        info["appointmentTypeID"],
+                "typeName":      info["typeName"],
+                "therapistName": extract_doctor_name(info["typeName"]),
             })
 
+    # Shuffle first so same-time slots rotate across therapists on each request
+    random.shuffle(all_slots)
+    # Then stable sort by time — shuffle order preserved within same time
     all_slots.sort(key=lambda x: x["time"])
 
     return {
