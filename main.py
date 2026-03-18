@@ -957,3 +957,24 @@ async def availability_dates_by_state(
         "timezone": timezone,
         "dates":    [{"date": d} for d in sorted(all_dates)]
     }
+
+#Temporary code..
+@app.get("/admin/test-caspio", tags=["Admin"])
+async def test_caspio():
+    """Test Caspio connection and return token status."""
+    try:
+        token = await get_caspio_token()
+        headers = await caspio_headers()
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{CASPIO_BASE_URL}/v2/tables/{CASPIO_TABLE}/records",
+                headers=headers,
+                params={"q.limit": 1}
+            )
+        return {
+            "caspio_token": "ok",
+            "table_ping_status": resp.status_code,
+            "table_ping_body": resp.json()
+        }
+    except Exception as e:
+        return {"error": str(e)}
