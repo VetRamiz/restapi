@@ -202,7 +202,7 @@ async def caspio_upsert_appointment(appointment: dict):
     "canceled":                        str(appointment.get("canceled", False)),
     "status":                          "Canceled" if appointment.get("canceled") else "Scheduled",
     "notes":                           appointment.get("notes", ""),
-    "referral_id":                     extract_referral_id(appointment),
+    "referral_id": int(extract_referral_id(appointment)) if extract_referral_id(appointment) else None,
     "calender_link":                   appointment.get("confirmationPage", ""),
     "confirmation_page_payment_link":  appointment.get("confirmationPagePaymentLink", ""),
     "link_to_clients_confirm":         appointment.get("confirmationPage", ""),
