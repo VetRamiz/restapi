@@ -804,18 +804,6 @@ async def availability_by_state(
     date:     str = Query(..., description="YYYY-MM-DD"),
     timezone: str = Query("America/New_York"),
 ):
-    """
-    ★ MAIN CASPIO ENDPOINT — Get available 50-min Psych Eval slots for a state.
-
-    Only returns appointment types that are:
-      - In a "Psychological Evaluation" category
-      - Exactly 50 minutes duration
-      - Have at least one calendar assigned
-
-    Example:
-      /availability/by-state?state=California&date=2026-04-10
-      /availability/by-state?state=New York&date=2026-04-10
-    """
     async with httpx.AsyncClient(timeout=15) as client:
         types_resp = await client.get(
             f"{ACUITY_BASE}/appointment-types",
@@ -826,13 +814,10 @@ async def availability_by_state(
 
     all_types = types_resp.json()
 
-    # State-specific 50-min psych eval types
     state_types = [
         t for t in all_types
         if is_50min_psych_eval(t) and matches_state(t, state)
     ]
-
-    # All-states / Thrive Online as supplemental coverage
     all_states_types = [
         t for t in all_types
         if is_50min_psych_eval(t) and is_all_states(t)
@@ -850,10 +835,10 @@ async def availability_by_state(
             "state":   state,
             "date":    date,
             "message": "No 50-minute Psychological Evaluation types found for this state",
-            "slots":   []
+            "slots":   [],
+            "therapists": []
         }
 
-    # Build calendarID → type info map (first-seen wins per calendar)
     calendar_type_map = {}
     for apt_type in matched_types:
         for cal_id in apt_type.get("calendarIDs", []):
@@ -864,7 +849,6 @@ async def availability_by_state(
                     "typeName":          apt_type.get("name", ""),
                 }
 
-    # Fetch availability for all calendars in parallel
     async with httpx.AsyncClient(timeout=20) as client:
         cal_ids = list(calendar_type_map.keys())
         tasks = [
@@ -882,14 +866,8 @@ async def availability_by_state(
         ]
         responses = await asyncio.gather(*tasks, return_exceptions=True)
 
-    
-
-    # Step 5: Merge slots
-
-
-    # Step 5: Build per-therapist slot groups
-    therapist_slots = {}  # calendarID → { info + slots[] }
-
+    # Build per-therapist slot groups
+    therapist_slots = {}
     for i, resp in enumerate(responses):
         cal_id = cal_ids[i]
         info   = calendar_type_map[cal_id]
@@ -901,21 +879,21 @@ async def availability_by_state(
             if slot.get("slotsAvailable", 0) < 1:
                 continue
             slots.append({
-                "time":      slot["time"],
-                "calendarID": cal_id,
-                "bookingUrl": info["schedulingUrl"],
-                "typeID":     info["appointmentTypeID"],
+                "time":          slot["time"],
+                "calendarID":    cal_id,
+                "bookingUrl":    info["schedulingUrl"],
+                "typeID":        info["appointmentTypeID"],
+                "therapistName": extract_doctor_name(info["typeName"]),
             })
 
-        if slots:  # only include therapist if they have available slots
-            slots.sort(key=lambda x: x["time"])  # sort this therapist's slots by time
+        if slots:
             therapist_slots[cal_id] = {
                 "calendarID":    cal_id,
                 "therapistName": extract_doctor_name(info["typeName"]),
                 "typeName":      info["typeName"],
                 "bookingUrl":    info["schedulingUrl"],
                 "typeID":        info["appointmentTypeID"],
-                "slots":         slots,
+                "slots":         sorted(slots, key=lambda x: x["time"]),
                 "totalSlots":    len(slots),
             }
 
@@ -923,10 +901,20 @@ async def availability_by_state(
     therapist_list = list(therapist_slots.values())
     random.shuffle(therapist_list)
 
-    # Flatten into all_slots for backward compatibility
-    all_slots = []
+    # ★ Interleave slots by time across therapists so same-time
+    # slots from different therapists are mixed, not blocked together
+    # e.g. 9am-BeverlyIbeh, 9am-MeganCannon, 10am-BeverlyIbeh ...
+    from collections import defaultdict
+    time_buckets = defaultdict(list)
     for therapist in therapist_list:
-        all_slots.extend(therapist["slots"])
+        for slot in therapist["slots"]:
+            time_buckets[slot["time"]].append(slot)
+
+    # Within each time bucket therapists are already shuffled above
+    # so just flatten sorted by time
+    all_slots = []
+    for time_key in sorted(time_buckets.keys()):
+        all_slots.extend(time_buckets[time_key])
 
     return {
         "state":          state,
@@ -935,10 +923,9 @@ async def availability_by_state(
         "totalSlots":     len(all_slots),
         "matchedTypes":   len(matched_types),
         "totalCalendars": len(therapist_slots),
-        "therapists":     therapist_list,   # ★ grouped view for Caspio
-        "slots":          all_slots         # ★ flat view for backward compat
+        "therapists":     therapist_list,  # grouped view — use in Caspio to show per-therapist
+        "slots":          all_slots        # flat interleaved view — shuffled within each time
     }
-
 
 @app.get("/availability/dates-by-state", tags=["Availability"])
 async def availability_dates_by_state(
