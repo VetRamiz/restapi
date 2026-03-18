@@ -882,31 +882,51 @@ async def availability_by_state(
         ]
         responses = await asyncio.gather(*tasks, return_exceptions=True)
 
-    import random
+    
 
     # Step 5: Merge slots
-    all_slots = []
+
+
+    # Step 5: Build per-therapist slot groups
+    therapist_slots = {}  # calendarID → { info + slots[] }
+
     for i, resp in enumerate(responses):
         cal_id = cal_ids[i]
         info   = calendar_type_map[cal_id]
         if isinstance(resp, Exception) or resp.status_code != 200:
             continue
+
+        slots = []
         for slot in resp.json():
             if slot.get("slotsAvailable", 0) < 1:
                 continue
-            all_slots.append({
-                "time":          slot["time"],
-                "calendarID":    cal_id,
-                "bookingUrl":    info["schedulingUrl"],
-                "typeID":        info["appointmentTypeID"],
-                "typeName":      info["typeName"],
-                "therapistName": extract_doctor_name(info["typeName"]),
+            slots.append({
+                "time":      slot["time"],
+                "calendarID": cal_id,
+                "bookingUrl": info["schedulingUrl"],
+                "typeID":     info["appointmentTypeID"],
             })
 
-    # Shuffle first so same-time slots rotate across therapists on each request
-    random.shuffle(all_slots)
-    # Then stable sort by time — shuffle order preserved within same time
-    all_slots.sort(key=lambda x: x["time"])
+        if slots:  # only include therapist if they have available slots
+            slots.sort(key=lambda x: x["time"])  # sort this therapist's slots by time
+            therapist_slots[cal_id] = {
+                "calendarID":    cal_id,
+                "therapistName": extract_doctor_name(info["typeName"]),
+                "typeName":      info["typeName"],
+                "bookingUrl":    info["schedulingUrl"],
+                "typeID":        info["appointmentTypeID"],
+                "slots":         slots,
+                "totalSlots":    len(slots),
+            }
+
+    # Shuffle therapist order on every request
+    therapist_list = list(therapist_slots.values())
+    random.shuffle(therapist_list)
+
+    # Flatten into all_slots for backward compatibility
+    all_slots = []
+    for therapist in therapist_list:
+        all_slots.extend(therapist["slots"])
 
     return {
         "state":          state,
@@ -914,8 +934,9 @@ async def availability_by_state(
         "timezone":       timezone,
         "totalSlots":     len(all_slots),
         "matchedTypes":   len(matched_types),
-        "totalCalendars": len(calendar_type_map),
-        "slots":          all_slots
+        "totalCalendars": len(therapist_slots),
+        "therapists":     therapist_list,   # ★ grouped view for Caspio
+        "slots":          all_slots         # ★ flat view for backward compat
     }
 
 
