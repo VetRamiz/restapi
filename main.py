@@ -633,34 +633,28 @@ async def acuity_webhook(
     background_tasks:   BackgroundTasks,
     x_acuity_signature: Optional[str] = Header(None)
 ):
-    """
-    Register this URL in Acuity → Integrations → Webhooks.
-    Handles all events and syncs to Caspio automatically.
-
-    Events handled:
-      scheduling.scheduled   → INSERT into Caspio (with referral_id)
-      scheduling.rescheduled → UPDATE in Caspio
-      scheduling.changed     → UPDATE in Caspio
-      scheduling.canceled    → Mark Canceled in Caspio
-      order.completed        → UPDATE in Caspio
-    """
     raw_body = await request.body()
 
     if not verify_acuity_signature(raw_body, x_acuity_signature):
         raise HTTPException(401, "Invalid webhook signature")
 
+    # Acuity sends form-encoded data, not JSON
     try:
-        data = await request.json()
-    except Exception:
-        raise HTTPException(400, "Invalid JSON payload")
+        from urllib.parse import parse_qs
+        parsed = parse_qs(raw_body.decode("utf-8"))
+        data = {k: v[0] for k, v in parsed.items()}
+    except Exception as e:
+        log.error("Failed to parse webhook body: %s | raw: %s", e, raw_body[:200])
+        raise HTTPException(400, "Invalid payload")
 
     action = data.get("action")
     apt_id = data.get("id")
 
+    log.info("Webhook parsed: action=%s id=%s", action, apt_id)
+
     if not apt_id:
         return {"status": "ignored", "reason": "no appointment id"}
 
-    # Deduplicate
     webhook_id = f"{action}_{apt_id}"
     if webhook_id in recent_webhooks:
         return {"status": "duplicate ignored"}
@@ -677,7 +671,6 @@ async def acuity_webhook(
         "scheduling.changed",
         "order.completed",
     ):
-        # Fetch full appointment so we get forms[] with referral_id
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
                 f"{ACUITY_BASE}/appointments/{apt_id}",
@@ -689,7 +682,6 @@ async def acuity_webhook(
             log.error("Failed to fetch appointment %s for webhook sync", apt_id)
 
     return {"status": "processed", "action": action, "id": apt_id}
-
 
 # ==================================================
 # FILTERING CONSTANTS  (50-min Psych Eval only)
