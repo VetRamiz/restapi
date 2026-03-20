@@ -686,10 +686,12 @@ async def acuity_webhook(
                 f"{ACUITY_BASE}/appointments/{apt_id}",
                 headers=acuity_headers()
             )
+        log.info("Acuity fetch status: %s for ID: %s", resp.status_code, apt_id)
         if resp.status_code == 200:
             background_tasks.add_task(caspio_upsert_appointment, resp.json())
         else:
-            log.error("Failed to fetch appointment %s for webhook sync", apt_id)
+            log.error("Failed to fetch appointment %s — status %s body %s",
+                      apt_id, resp.status_code, resp.text[:200])
 
     return {"status": "processed", "action": action, "id": apt_id}
 
