@@ -154,17 +154,20 @@ def verify_acuity_signature(raw_body: bytes, signature: Optional[str]) -> bool:
 # REFERRAL ID HELPER
 # --------------------------------------------------
 
-def extract_referral_id(appointment: dict) -> str:
-    """
-    Parse referral_id from Acuity appointment custom form fields.
-    Acuity returns forms as: appointment["forms"] = [{ "values": [{ "name": "...", "value": "..." }] }]
-    Make sure your Acuity form field is named exactly "referral_id".
-    """
+def extract_referral_id(appointment: dict):
+    """Extract referral_id from Acuity appointment forms by field ID 18222169."""
     for form in appointment.get("forms", []):
         for field in form.get("values", []):
-            if field.get("name", "").lower() == "referral_id":
-                return field.get("value", "")
-    return ""
+            # match by field ID (most reliable) or name as fallback
+            if field.get("fieldID") == 18222169 or field.get("name", "").lower() == "referral_id":
+                val = field.get("value", "")
+                try:
+                    return int(val) if val else None
+                except (ValueError, TypeError):
+                    return None
+    return None
+
+
 
 
 # --------------------------------------------------
