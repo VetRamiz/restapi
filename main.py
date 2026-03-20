@@ -190,7 +190,7 @@ async def caspio_upsert_appointment(appointment: dict):
         return
 
     record = {
-    "appointment_id":                  str(apt_id),
+    "appointment_id":                  int(apt_id),   # ← remove str(), use int()
     "patient_first_name":              appointment.get("firstName", ""),
     "patient_second_name":             appointment.get("lastName", ""),
     "patient_email":                   appointment.get("email", ""),
@@ -225,7 +225,7 @@ async def caspio_upsert_appointment(appointment: dict):
             check = await client.get(
                 f"{CASPIO_API_BASE_URL}/v2/tables/{CASPIO_TABLE}/records",
                 headers=headers,
-                params={"q.where": f"appointment_id={apt_id}", "q.limit": 1}
+                params={"q.where": f"appointment_id={int(apt_id)}", "q.limit": 1}
             )
             log.info("Caspio check status: %s body: %s", check.status_code, check.text[:200])
             existing = check.json().get("Result", [])
@@ -259,7 +259,7 @@ async def caspio_mark_canceled(apt_id: int):
         await client.put(
             f"{CASPIO_API_BASE_URL}/v2/tables/{CASPIO_TABLE}/records",
             headers=headers,
-            params={"q.where": f"appointment_id={apt_id}"},
+            params={"q.where": f"appointment_id={int(apt_id)}"},
             json={
                 "status":      "Canceled",        # ✅ lowercase to match Caspio column
                 "updated_on":  datetime.utcnow().isoformat()
