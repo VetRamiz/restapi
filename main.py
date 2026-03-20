@@ -638,14 +638,24 @@ async def acuity_webhook(
     if not verify_acuity_signature(raw_body, x_acuity_signature):
         raise HTTPException(401, "Invalid webhook signature")
 
-    # Acuity sends form-encoded data, not JSON
+    # Try JSON first, fall back to form-encoded
+    data = None
     try:
-        from urllib.parse import parse_qs
-        parsed = parse_qs(raw_body.decode("utf-8"))
-        data = {k: v[0] for k, v in parsed.items()}
-    except Exception as e:
-        log.error("Failed to parse webhook body: %s | raw: %s", e, raw_body[:200])
-        raise HTTPException(400, "Invalid payload")
+        data = await request.json()
+    except Exception:
+        pass
+
+    if not data:
+        try:
+            from urllib.parse import parse_qs
+            parsed = parse_qs(raw_body.decode("utf-8"))
+            data = {k: v[0] for k, v in parsed.items()}
+        except Exception as e:
+            log.error("Failed to parse webhook body: %s | raw: %s", e, raw_body[:200])
+            raise HTTPException(400, "Invalid payload")
+
+    if not data:
+        raise HTTPException(400, "Empty payload")
 
     action = data.get("action")
     apt_id = data.get("id")
@@ -1028,12 +1038,3 @@ async def test_caspio():
     
 
 
-@app.post("/webhooks/acuity", tags=["Webhooks"])
-async def acuity_webhook(
-    request:            Request,
-    background_tasks:   BackgroundTasks,
-    x_acuity_signature: Optional[str] = Header(None)
-):
-    raw_body = await request.body()
-    log.info("Webhook raw body: %s", raw_body[:200])
-    log.info("Webhook signature header: %s", x_acuity_signature)
