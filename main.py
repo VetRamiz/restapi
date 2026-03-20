@@ -638,33 +638,18 @@ async def acuity_webhook(
     if not verify_acuity_signature(raw_body, x_acuity_signature):
         raise HTTPException(401, "Invalid webhook signature")
 
-    # Try JSON first, fall back to form-encoded
-    data = None
     try:
         data = await request.json()
     except Exception:
-        pass
-
-    if not data:
-        try:
-            from urllib.parse import parse_qs
-            parsed = parse_qs(raw_body.decode("utf-8"))
-            data = {k: v[0] for k, v in parsed.items()}
-        except Exception as e:
-            log.error("Failed to parse webhook body: %s | raw: %s", e, raw_body[:200])
-            raise HTTPException(400, "Invalid payload")
-
-    if not data:
-        raise HTTPException(400, "Empty payload")
+        raise HTTPException(400, "Invalid JSON payload")
 
     action = data.get("action")
     apt_id = data.get("id")
 
-    log.info("Webhook parsed: action=%s id=%s", action, apt_id)
-
     if not apt_id:
         return {"status": "ignored", "reason": "no appointment id"}
 
+    # Deduplicate
     webhook_id = f"{action}_{apt_id}"
     if webhook_id in recent_webhooks:
         return {"status": "duplicate ignored"}
@@ -673,7 +658,8 @@ async def acuity_webhook(
     log.info("Webhook received: action=%s id=%s", action, apt_id)
 
     if action == "scheduling.canceled":
-        background_tasks.add_task(caspio_mark_canceled, int(apt_id))
+        await caspio_mark_canceled(int(apt_id))
+        log.info("Caspio mark canceled completed for ID: %s", apt_id)
 
     elif action in (
         "scheduling.scheduled",
@@ -681,21 +667,24 @@ async def acuity_webhook(
         "scheduling.changed",
         "order.completed",
     ):
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                f"{ACUITY_BASE}/appointments/{apt_id}",
-                headers=acuity_headers()
-            )
-        log.info("Acuity fetch status: %s for ID: %s", resp.status_code, apt_id)
-        if resp.status_code == 200:
-            # ★ Run directly instead of background task
-            await caspio_upsert_appointment(resp.json())
-            log.info("Caspio upsert completed for ID: %s", apt_id)
-        else:
-            log.error("Failed to fetch appointment %s — status %s body %s",
-                      apt_id, resp.status_code, resp.text[:200])
+        # ★ Run DIRECTLY — no background task
+        try:
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    f"{ACUITY_BASE}/appointments/{apt_id}",
+                    headers=acuity_headers()
+                )
+            log.info("Acuity fetch status: %s for ID: %s", resp.status_code, apt_id)
+            if resp.status_code == 200:
+                await caspio_upsert_appointment(resp.json())
+                log.info("Caspio upsert completed for ID: %s", apt_id)
+            else:
+                log.error("Acuity fetch failed: %s %s", resp.status_code, resp.text[:200])
+        except Exception as e:
+            log.error("Webhook processing error: %s", str(e))
 
     return {"status": "processed", "action": action, "id": apt_id}
+
 
 
 # ==================================================
