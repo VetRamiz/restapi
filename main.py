@@ -1033,3 +1033,15 @@ async def test_caspio():
         }
     except Exception as e:
         return {"error": str(e)}
+    
+
+
+@app.post("/webhooks/acuity", tags=["Webhooks"])
+async def acuity_webhook(
+    request:            Request,
+    background_tasks:   BackgroundTasks,
+    x_acuity_signature: Optional[str] = Header(None)
+):
+    raw_body = await request.body()
+    log.info("Webhook raw body: %s", raw_body[:200])
+    log.info("Webhook signature header: %s", x_acuity_signature)
