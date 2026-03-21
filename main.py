@@ -6,6 +6,7 @@ import logging
 from collections import deque
 from datetime import datetime
 import random
+import re
 from typing import Optional, List
 
 import httpx
@@ -155,19 +156,29 @@ def verify_acuity_signature(raw_body: bytes, signature: Optional[str]) -> bool:
 # REFERRAL ID HELPER
 # --------------------------------------------------
 
-def extract_referral_id(appointment: dict):
-    """Extract referral_id from Acuity appointment forms by field ID 18222169."""
+def extract_referral_id(appointment: dict) -> Optional[str]:
     for form in appointment.get("forms", []):
         for field in form.get("values", []):
-            # match by field ID (most reliable) or name as fallback
-            if field.get("fieldID") == 18222169 or field.get("name", "").lower() == "referral_id":
-                val = field.get("value", "")
-                try:
-                    return int(val) if val else None
-                except (ValueError, TypeError):
-                    return None
-    return None
+            if (
+                field.get("fieldID") == 18222169
+                or field.get("name", "").lower() == "referral_id"
+            ):
+                val = field.get("value", "").strip()
+                return val if val else None
 
+    # Fallback — parse formsText
+    forms_text = appointment.get("formsText", "")
+    if forms_text:
+        match = re.search(
+            r"referral[_\s]?id[:\s]+([^\n]+)",
+            forms_text,
+            re.IGNORECASE
+        )
+        if match:
+            val = match.group(1).strip()
+            return val if val else None
+
+    return None
 
 
 
@@ -796,6 +807,37 @@ def is_all_states(apt_type: dict) -> bool:
 # ==================================================
 # STATE-BASED AVAILABILITY ROUTES
 # ==================================================
+# --------------------------------------------------
+# PSYPACT CONFIGURATION
+# --------------------------------------------------
+
+NON_PSYPACT_STATES = {
+    "New York",
+    "Hawaii",
+    "Iowa",
+    "Alaska",
+    "Oregon",
+    "New Mexico",
+    "Louisiana",
+    "California",
+    "Massachusetts",
+}
+
+PSYPACT_STATES = {
+    "Alabama", "Arizona", "Arkansas", "Colorado", "Connecticut",
+    "Delaware", "Florida", "Georgia", "Idaho", "Illinois",
+    "Indiana", "Kansas", "Kentucky", "Maine", "Maryland",
+    "Michigan", "Minnesota", "Missouri", "Montana", "Nebraska",
+    "Nevada", "New Hampshire", "New Jersey", "North Carolina",
+    "North Dakota", "Ohio", "Oklahoma", "Pennsylvania", "Rhode Island",
+    "South Carolina", "South Dakota", "Tennessee", "Texas", "Utah",
+    "Vermont", "Virginia", "Washington", "West Virginia", "Wisconsin",
+    "Wyoming",
+}
+
+def is_psypact_state(state: str) -> bool:
+    return state not in NON_PSYPACT_STATES
+
 def extract_doctor_name(type_name: str) -> str:
     """Extract doctor name from appointment type name.
     e.g. 'Thrive Santa Monica: 50 Minute Online Psychological Evaluation with Dr. Tamara Rumburg'
@@ -804,6 +846,7 @@ def extract_doctor_name(type_name: str) -> str:
     if " with " in type_name:
         return type_name.split(" with ")[-1].strip()
     return type_name
+
 @app.get("/availability/by-state", tags=["Availability"])
 async def availability_by_state(
     state:    str = Query(..., description="Full state name e.g. 'California', 'New York'"),
@@ -820,30 +863,47 @@ async def availability_by_state(
 
     all_types = types_resp.json()
 
-    state_types = [
-        t for t in all_types
-        if is_50min_psych_eval(t) and matches_state(t, state)
-    ]
-    all_states_types = [
-        t for t in all_types
-        if is_50min_psych_eval(t) and is_all_states(t)
-    ]
-
-    matched_types = state_types if state_types else all_states_types
-    if state_types and all_states_types:
-        existing_ids = {t["id"] for t in state_types}
-        for t in all_states_types:
-            if t["id"] not in existing_ids:
+    if is_psypact_state(state):
+        # ★ PSYPACT — bundle ALL psypact state types together
+        matched_types = []
+        seen_ids = set()
+        for psypact_state in PSYPACT_STATES:
+            for t in all_types:
+                if t["id"] not in seen_ids and is_50min_psych_eval(t) and matches_state(t, psypact_state):
+                    matched_types.append(t)
+                    seen_ids.add(t["id"])
+        # also add all-states types
+        for t in all_types:
+            if t["id"] not in seen_ids and is_50min_psych_eval(t) and is_all_states(t):
                 matched_types.append(t)
+                seen_ids.add(t["id"])
+    else:
+        # ★ NON-PSYPACT — existing behavior, state-specific only
+        state_types = [
+            t for t in all_types
+            if is_50min_psych_eval(t) and matches_state(t, state)
+        ]
+        all_states_types = [
+            t for t in all_types
+            if is_50min_psych_eval(t) and is_all_states(t)
+        ]
+        matched_types = state_types if state_types else all_states_types
+        if state_types and all_states_types:
+            existing_ids = {t["id"] for t in state_types}
+            for t in all_states_types:
+                if t["id"] not in existing_ids:
+                    matched_types.append(t)
 
     if not matched_types:
         return {
             "state":   state,
             "date":    date,
             "message": "No 50-minute Psychological Evaluation types found for this state",
-            "slots":   [],
-            "therapists": []
+            "slots":   []
         }
+
+    # rest of the function stays exactly the same...
+    # (calendar_type_map, parallel fetch, merge slots, shuffle, sort)
 
     calendar_type_map = {}
     for apt_type in matched_types:
@@ -939,14 +999,6 @@ async def availability_dates_by_state(
     month:    Optional[str] = Query(None, description="YYYY-MM. Defaults to current month"),
     timezone: str           = Query("America/New_York"),
 ):
-    """
-    Get available DATES for 50-min Psych Evals in a state for a given month.
-    Caspio calls this first to show date chips to the patient.
-
-    Example:
-      /availability/dates-by-state?state=New York&month=2026-04
-      /availability/dates-by-state?state=California&month=2026-04
-    """
     if not month:
         month = datetime.now().strftime("%Y-%m")
 
@@ -960,22 +1012,37 @@ async def availability_dates_by_state(
 
     all_types = types_resp.json()
 
-    state_types = [
-        t for t in all_types
-        if is_50min_psych_eval(t) and matches_state(t, state)
-    ]
-    all_states_types = [
-        t for t in all_types
-        if is_50min_psych_eval(t) and is_all_states(t)
-    ]
-
-    matched_types = state_types if state_types else all_states_types
-    if state_types and all_states_types:
-        existing_ids = {t["id"] for t in state_types}
-        for t in all_states_types:
-            if t["id"] not in existing_ids:
+    if is_psypact_state(state):
+        # ★ PSYPACT — bundle all psypact states
+        matched_types = []
+        seen_ids = set()
+        for psypact_state in PSYPACT_STATES:
+            for t in all_types:
+                if t["id"] not in seen_ids and is_50min_psych_eval(t) and matches_state(t, psypact_state):
+                    matched_types.append(t)
+                    seen_ids.add(t["id"])
+        for t in all_types:
+            if t["id"] not in seen_ids and is_50min_psych_eval(t) and is_all_states(t):
                 matched_types.append(t)
+                seen_ids.add(t["id"])
+    else:
+        # ★ NON-PSYPACT — existing behavior
+        state_types = [
+            t for t in all_types
+            if is_50min_psych_eval(t) and matches_state(t, state)
+        ]
+        all_states_types = [
+            t for t in all_types
+            if is_50min_psych_eval(t) and is_all_states(t)
+        ]
+        matched_types = state_types if state_types else all_states_types
+        if state_types and all_states_types:
+            existing_ids = {t["id"] for t in state_types}
+            for t in all_states_types:
+                if t["id"] not in existing_ids:
+                    matched_types.append(t)
 
+    # rest stays the same...
     calendar_type_map = {}
     for apt_type in matched_types:
         for cal_id in apt_type.get("calendarIDs", []):
@@ -1040,3 +1107,11 @@ async def test_caspio():
     
 
 
+@app.get("/states/psypact-check", tags=["Configuration"])
+async def psypact_check(state: str = Query(...)):
+    """Check if a state is PSYPACT or non-PSYPACT."""
+    return {
+        "state":      state,
+        "is_psypact": is_psypact_state(state),
+        "pool":       "psypact" if is_psypact_state(state) else "state-specific"
+    }
