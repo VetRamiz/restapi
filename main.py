@@ -635,17 +635,21 @@ async def acuity_webhook(
     x_acuity_signature: Optional[str] = Header(None)
 ):
     raw_body = await request.body()
+    log.info("Webhook raw body: %s", raw_body[:300])
 
     if not verify_acuity_signature(raw_body, x_acuity_signature):
         raise HTTPException(401, "Invalid webhook signature")
 
+    # ★ Parse as form data, not JSON
     try:
-        data = await request.json()
-    except Exception:
-        raise HTTPException(400, "Invalid JSON payload")
-
-    action = data.get("action")
-    apt_id = data.get("id")
+        from urllib.parse import parse_qs
+        parsed = parse_qs(raw_body.decode("utf-8"))
+        action = parsed.get("action", [None])[0]
+        apt_id = parsed.get("id", [None])[0]
+        log.info("Parsed action=%s id=%s", action, apt_id)
+    except Exception as e:
+        log.error("Failed to parse webhook body: %s", e)
+        raise HTTPException(400, "Invalid payload")
 
     if not apt_id:
         return {"status": "ignored", "reason": "no appointment id"}
@@ -659,8 +663,11 @@ async def acuity_webhook(
     log.info("Webhook received: action=%s id=%s", action, apt_id)
 
     if action == "scheduling.canceled":
-        await caspio_mark_canceled(int(apt_id))
-        log.info("Caspio mark canceled completed for ID: %s", apt_id)
+        try:
+            await caspio_mark_canceled(int(apt_id))
+            log.info("Caspio mark canceled completed for ID: %s", apt_id)
+        except Exception as e:
+            log.error("Cancel failed: %s", e)
 
     elif action in (
         "scheduling.scheduled",
@@ -668,7 +675,6 @@ async def acuity_webhook(
         "scheduling.changed",
         "order.completed",
     ):
-        # ★ Run DIRECTLY — no background task
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.get(
@@ -685,6 +691,7 @@ async def acuity_webhook(
             log.error("Webhook processing error: %s", str(e))
 
     return {"status": "processed", "action": action, "id": apt_id}
+
 
 
 
