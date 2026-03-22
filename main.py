@@ -149,11 +149,7 @@ def verify_acuity_signature(raw_body: bytes, signature: Optional[str]) -> bool:
 # --------------------------------------------------
 
 def extract_referral_id(appointment: dict) -> Optional[str]:
-    """
-    Extract referral_id from Acuity appointment forms.
-    Tries structured field (ID 18222169) first, then raw formsText fallback.
-    Returns as plain string (Text field in Caspio).
-    """
+    # Method 1 — structured field by ID (most reliable)
     for form in appointment.get("forms", []):
         for field in form.get("values", []):
             if (
@@ -161,21 +157,30 @@ def extract_referral_id(appointment: dict) -> Optional[str]:
                 or field.get("name", "").lower() == "referral_id"
             ):
                 val = field.get("value", "").strip()
-                return val if val else None
+                # Guard — reject if it looks like a full form dump
+                if val and len(val) < 100 and "\n" not in val:
+                    return val
 
-    # Fallback — parse formsText raw string
+    # Method 2 — parse formsText
+    # Acuity format:
+    # referral_id
+    # ============
+    # referral_id: TEST-REF-001   ← we want only this value
     forms_text = appointment.get("formsText", "")
     if forms_text:
+        # Require colon — skips the header line, matches value line only
         match = re.search(
-            r"referral[_\s]?id[:\s]+([^\n]+)",
+            r"referral_id:\s*([^\n\r]+)",
             forms_text,
             re.IGNORECASE
         )
         if match:
             val = match.group(1).strip()
-            return val if val else None
+            if val and len(val) < 100:
+                return val
 
     return None
+
 
 
 # --------------------------------------------------
