@@ -150,8 +150,8 @@ async def caspio_headers():
     ).hexdigest()
     return hmac.compare_digest(expected, signature)
 
-def verify_acuity_signature(raw_body: bytes, signature: Optional[str]) -> bool:
-    return True
+def verify_acuity_signature(raw_body, signature):
+    return True  # disable until secret is confirmed
 # --------------------------------------------------
 # REFERRAL ID HELPER
 # --------------------------------------------------
@@ -707,66 +707,119 @@ async def acuity_webhook(
 
 
 # ==================================================
-# FILTERING CONSTANTS  (50-min Psych Eval only)
+# FILTERING CONSTANTS
 # ==================================================
 
-# Matches category strings like:
-#   "THRIVE CALIFORNIA: Psychological Evaluation"
-#   "THRIVE NEW YORK: PSYCHOLOGICAL EVALUATION"
 PSYCH_EVAL_CATEGORY_KEYWORD = "PSYCHOLOGICAL EVALUATION"
-
-# Only 50-minute evaluations
 ALLOWED_DURATION = 50
 
-STATE_KEYWORDS = {
-    "California":     ["CALIFORNIA"],
-    "New York":       ["NEW YORK"],
-    "Connecticut":    ["CONNECTICUT"],
-    "Florida":        ["FLORIDA"],
-    "Georgia":        ["GEORGIA"],
-    "Illinois":       ["ILLINOIS"],
-    "Maine":          ["MAINE"],
-    "North Carolina": ["NORTH CAROLINA"],
-    "Pennsylvania":   ["PENNSYLVANIA"],
-    "Tennessee":      ["TENNESSEE"],
-    "Texas":          ["TEXAS"],
-    "Washington":     ["WASHINGTON"],
-    "Wyoming":        ["WYOMING", "(WY)"],
-    "Virginia":       ["VIRGINIA"],
-    "Massachusetts":  ["MASSACHUSETTS"],
-    "Ohio":           ["OHIO"],
-    "Michigan":       ["MICHIGAN"],
-    "Colorado":       ["COLORADO"],
-    "Arizona":        ["ARIZONA"],
-    "New Jersey":     ["NEW JERSEY"],
-    "Maryland":       ["MARYLAND"],
-    "Wisconsin":      ["WISCONSIN"],
-    "Minnesota":      ["MINNESOTA"],
-    "Indiana":        ["INDIANA"],
-    "Missouri":       ["MISSOURI"],
-    "Oklahoma":       ["OKLAHOMA"],
-    "Louisiana":      ["LOUISIANA"],
-    "Alabama":        ["ALABAMA"],
-    "Kentucky":       ["KENTUCKY"],
-    "South Carolina": ["SOUTH CAROLINA"],
-    "Rhode Island":   ["RHODE ISLAND"],
-    "Vermont":        ["VERMONT"],
+# ★ Non-PSYPACT states — shown separately per state
+NON_PSYPACT_STATES = {
+    "New York",
+    "Hawaii",
+    "Iowa",
+    "Alaska",
+    "Oregon",
+    "New Mexico",
+    "Louisiana",
+    "California",
+    "Massachusetts",
 }
 
-ALL_STATES_KEYWORDS = ["ALL STATES", "THRIVE ONLINE"]
+# ★ STATE_KEYWORDS — built from your actual Acuity category/name patterns
+STATE_KEYWORDS = {
+    # Non-PSYPACT
+    "California":     ["CALIFORNIA", "SANTA MONICA"],
+    "New York":       ["NEW YORK", "THRIVE NY", "THRIVE NEW YORK"],
+    "Hawaii":         ["HAWAII", "THRIVE HAWAII"],
+    "Alaska":         ["ALASKA", "THRIVE ALASKA"],
+    "Oregon":         ["OREGON", "THRIVE OREGON"],
+    "New Mexico":     ["NEW MEXICO", "THRIVE NEW MEXICO"],
+    "Louisiana":      ["LOUISIANA", "THRIVE LOUISIANA"],
+    "Massachusetts":  ["MASSACHUSETTS", "THRIVE MASSACHUSETTS"],
+    "Iowa":           ["IOWA", "THRIVE IOWA", "THRIVE IA"],
+
+    # PSYPACT states
+    "Indiana":        ["INDIANA", "THRIVE INDIANA"],
+    "District of Columbia": ["THRIVE DC", " DC:"],
+    "Pennsylvania":   ["PENNSYLVANIA", "THRIVE PENNSYLVANIA", "THRIVE PA"],
+    "Texas":          ["TEXAS", "THRIVE TEXAS", "THRIVE TX"],
+    "Alabama":        ["ALABAMA", "THRIVE ALABAMA"],
+    "Arizona":        ["ARIZONA", "THRIVE ARIZONA"],
+    "Arkansas":       ["ARKANSAS", "THRIVE ARKANSAS"],
+    "Colorado":       ["COLORADO", "THRIVE COLORADO"],
+    "Connecticut":    ["CONNECTICUT", "THRIVE CONNECTICUT"],
+    "Delaware":       ["DELAWARE", "THRIVE DELAWARE"],
+    "Florida":        ["FLORIDA", "THRIVE FLORIDA"],
+    "Georgia":        ["GEORGIA", "THRIVE GEORGIA"],
+    "Idaho":          ["IDAHO", "THRIVE IDAHO"],
+    "Illinois":       ["ILLINOIS", "THRIVE ILLINOIS"],
+    "Kansas":         ["KANSAS", "THRIVE KANSAS"],
+    "Kentucky":       ["KENTUCKY", "THRIVE KENTUCKY"],
+    "Maine":          ["MAINE", "THRIVE MAINE"],
+    "Maryland":       ["MARYLAND", "THRIVE MARYLAND"],
+    "Michigan":       ["MICHIGAN", "THRIVE MICHIGAN"],
+    "Minnesota":      ["MINNESOTA", "THRIVE MINNESOTA"],
+    "Missouri":       ["MISSOURI", "THRIVE MISSOURI"],
+    "Montana":        ["MONTANA", "THRIVE MONTANA"],
+    "Nebraska":       ["NEBRASKA", "THRIVE NEBRASKA"],
+    "Nevada":         ["NEVADA", "THRIVE NEVADA"],
+    "New Hampshire":  ["NEW HAMPSHIRE", "THRIVE NEW HAMPSHIRE"],
+    "New Jersey":     ["NEW JERSEY", "THRIVE NEW JERSEY"],
+    "North Carolina": ["NORTH CAROLINA", "THRIVE NORTH CAROLINA", "THRIVE NC"],
+    "North Dakota":   ["NORTH DAKOTA", "THRIVE NORTH DAKOTA"],
+    "Ohio":           ["OHIO", "THRIVE OHIO"],
+    "Oklahoma":       ["OKLAHOMA", "THRIVE OKLAHOMA"],
+    "Rhode Island":   ["RHODE ISLAND", "THRIVE RHODE ISLAND"],
+    "South Carolina": ["SOUTH CAROLINA", "THRIVE SOUTH CAROLINA"],
+    "South Dakota":   ["SOUTH DAKOTA", "THRIVE SOUTH DAKOTA"],
+    "Tennessee":      ["TENNESSEE", "THRIVE TENNESSEE"],
+    "Utah":           ["UTAH", "THRIVE UTAH"],
+    "Vermont":        ["VERMONT", "THRIVE VERMONT"],
+    "Virginia":       ["VIRGINIA", "THRIVE VIRGINIA"],
+    "Washington":     ["WASHINGTON", "THRIVE WASHINGTON"],
+    "West Virginia":  ["WEST VIRGINIA", "THRIVE WEST VIRGINIA"],
+    "Wisconsin":      ["WISCONSIN", "THRIVE WISCONSIN"],
+    "Wyoming":        ["WYOMING", "THRIVE WYOMING", "(WY)"],
+}
+
+# ★ These category patterns = available to ALL PSYPACT states
+# "THRIVE: Psychological Evaluation" (bare, no state) = PSYPACT pool
+ALL_STATES_KEYWORDS = [
+    "ALL STATES",
+    "THRIVE ONLINE",
+    "PSYPACT",
+    "THRIVE PSYPACT",
+]
+
+# ★ Bare "THRIVE: Psychological Evaluation" = PSYPACT pool
+# detected separately via is_psypact_generic()
+def is_psypact_generic(apt_type: dict) -> bool:
+    """
+    Returns True for types with category exactly 'THRIVE: Psychological Evaluation'
+    — no state specified — available to all PSYPACT states.
+    """
+    category = apt_type.get("category", "").upper().strip()
+    return category == "THRIVE: PSYCHOLOGICAL EVALUATION"
+
+
+def is_all_states(apt_type: dict) -> bool:
+    """Returns True if type serves all states (PSYPACT pool)."""
+    cat = apt_type.get("category", "").upper()
+    for kw in ALL_STATES_KEYWORDS:
+        if kw.upper() in cat:
+            return True
+    return is_psypact_generic(apt_type)  # ★ also catches bare THRIVE: types
+
+
+def is_psypact_state(state: str) -> bool:
+    return state not in NON_PSYPACT_STATES
 
 
 def is_50min_psych_eval(apt_type: dict) -> bool:
     """
-    Returns True only for 50-minute Online Psychological Evaluations.
-
-    Rules:
-      - category must contain "PSYCHOLOGICAL EVALUATION"
-      - duration must be exactly 50 minutes
-      - must have at least one calendarID assigned (inactive/unassigned types are skipped)
-
-    This approach is robust: new doctors added in Acuity are picked up automatically
-    without any code changes, as long as they follow the same category naming pattern.
+    Returns True only for 50-minute Psychological Evaluations with a calendar assigned.
+    Handles both string '50' and integer 50 from Acuity API.
     """
     category = apt_type.get("category", "").upper()
     duration  = apt_type.get("duration")
@@ -774,9 +827,14 @@ def is_50min_psych_eval(apt_type: dict) -> bool:
     if PSYCH_EVAL_CATEGORY_KEYWORD not in category:
         return False
 
-    if duration != ALLOWED_DURATION:
+    # ★ Handle both "50" string and 50 integer
+    try:
+        if int(duration) != ALLOWED_DURATION:
+            return False
+    except (TypeError, ValueError):
         return False
 
+    # Must have at least one calendar assigned
     if not apt_type.get("calendarIDs"):
         return False
 
