@@ -613,7 +613,7 @@ async def acuity_webhook(
 
     log.info("Webhook received: action=%s id=%s", action, apt_id)
 
-    if action == "scheduling.canceled":
+    if action in ("scheduling.canceled", "canceled"):
         try:
             await caspio_mark_canceled(int(apt_id))
             log.info("Caspio mark canceled completed for ID: %s", apt_id)
@@ -625,6 +625,12 @@ async def acuity_webhook(
     "scheduling.rescheduled",
     "scheduling.changed",
     "order.completed",
+    # ★ Acuity sometimes sends without "scheduling." prefix
+    "scheduled",
+    "rescheduled",
+    "changed",
+    "canceled",
+
     ):
         try:
             # ★ Wait 3 seconds — gives Acuity time to save form data
