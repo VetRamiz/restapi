@@ -755,6 +755,24 @@ def get_matched_types(all_types: list, state: str) -> list:
     # Case 3 — outside US or unrecognized → all therapists
     return eligible
 
+def pick_best_type(types_for_calendar: list, state: str) -> dict:
+    """
+    When multiple appointment types share the same calendarID,
+    pick the most state-relevant one:
+    1. Exact state match (e.g. THRIVE INDIANA for Indiana query)
+    2. Generic THRIVE: type (no state)
+    3. Any other PSYPACT type
+    """
+    # Priority 1 — exact state match
+    for t in types_for_calendar:
+        if matches_state(t, state):
+            return t
+    # Priority 2 — generic THRIVE: type
+    for t in types_for_calendar:
+        if t.get("category", "").upper().strip() == "THRIVE: PSYCHOLOGICAL EVALUATION":
+            return t
+    # Priority 3 — first available
+    return types_for_calendar[0]
 
 def extract_doctor_name(type_name: str) -> str:
     """'...with Dr. Tamara Rumburg' → 'Dr. Tamara Rumburg'"""
@@ -802,15 +820,21 @@ async def availability_by_state(
         }
 
     # calendarID → type info map (first-seen per calendar wins)
-    calendar_type_map = {}
+    # Group all matched types by calendarID
+    cal_to_types = defaultdict(list)
     for apt_type in matched_types:
         for cal_id in apt_type.get("calendarIDs", []):
-            if cal_id not in calendar_type_map:
-                calendar_type_map[cal_id] = {
-                    "appointmentTypeID": apt_type["id"],
-                    "schedulingUrl":     apt_type.get("schedulingUrl", ""),
-                    "typeName":          apt_type.get("name", ""),
-                }
+            cal_to_types[cal_id].append(apt_type)
+
+    # Pick the most state-relevant type per calendar
+    calendar_type_map = {}
+    for cal_id, types in cal_to_types.items():
+        best = pick_best_type(types, state)
+        calendar_type_map[cal_id] = {
+            "appointmentTypeID": best["id"],
+            "schedulingUrl":     best.get("schedulingUrl", ""),
+            "typeName":          best.get("name", ""),
+        }
 
     # Fetch all calendars in parallel
     async with httpx.AsyncClient(timeout=20) as client:
@@ -920,12 +944,21 @@ async def availability_dates_by_state(
 
     matched_types = get_matched_types(types_resp.json(), state)
 
-    calendar_type_map = {}
+    # Group all matched types by calendarID
+    cal_to_types = defaultdict(list)
     for apt_type in matched_types:
         for cal_id in apt_type.get("calendarIDs", []):
-            if cal_id not in calendar_type_map:
-                calendar_type_map[cal_id] = apt_type["id"]
+            cal_to_types[cal_id].append(apt_type)
 
+    # Pick the most state-relevant type per calendar
+    calendar_type_map = {}
+    for cal_id, types in cal_to_types.items():
+        best = pick_best_type(types, state)
+        calendar_type_map[cal_id] = {
+            "appointmentTypeID": best["id"],
+            "schedulingUrl":     best.get("schedulingUrl", ""),
+            "typeName":          best.get("name", ""),
+        }
     if not calendar_type_map:
         return {"state": state, "month": month, "dates": []}
 
