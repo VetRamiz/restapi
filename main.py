@@ -203,41 +203,41 @@ async def caspio_upsert_appointment(appointment: dict):
         return
 
     record = {
-        "appointment_id":                  int(apt_id),
-        "patient_first_name":              appointment.get("firstName", ""),
-        "patient_second_name":             appointment.get("lastName", ""),
-        "patient_email":                   appointment.get("email", ""),
-        "phone_number":                    appointment.get("phone", ""),
-        "date_of_appointment":             appointment.get("date", ""),
-        "time_of_appointment":             appointment.get("datetime", ""),
-        "ending_time_of_appointment":      appointment.get("endTime", ""),
-        "calender_name":                   appointment.get("calendar", ""),
-        "calendar_id":                     str(appointment.get("calendarID", "")),
-        "appointment_type":                appointment.get("type", ""),
-        "appointment_type_id":             str(appointment.get("appointmentTypeID", "")),
-        "duration_of_appointment_minutes": str(appointment.get("duration", "")),
-        "canceled":                        str(appointment.get("canceled", False)),
-        "status":                          "Canceled" if appointment.get("canceled") else "Scheduled",
-        "notes":                           appointment.get("notes", ""),
-        "referral_id":                     extract_referral_id(appointment),  # Text field
-        "calender_link":                   appointment.get("confirmationPage", ""),
-        "confirmation_page_payment_link":  appointment.get("confirmationPagePaymentLink", ""),
-        "link_to_clients_confirm":         appointment.get("confirmationPage", ""),
-        "amount_paid":                     float(appointment.get("amountPaid", 0)),
-        "has_been_paid":                   appointment.get("paid", "no"),
-        "price_of_appointment":            float(appointment.get("price", 0)),
-        "price_sold":                      str(appointment.get("priceSold", "")),
-        "client_time_zone":                appointment.get("timezone", ""),
-        "calendar_timezone":               appointment.get("calendarTimezone", ""),
-        "updated_on":                      datetime.utcnow().isoformat(),
-    }
+    "appointment_id":                  str(apt_id),          # ★ Text field — use str not int
+    "patient_first_name":              appointment.get("firstName", ""),
+    "patient_second_name":             appointment.get("lastName", ""),
+    "patient_email":                   appointment.get("email", ""),
+    "phone_number":                    appointment.get("phone", ""),
+    "date_of_appointment":             appointment.get("date", ""),
+    "time_of_appointment":             appointment.get("datetime", ""),
+    "ending_time_of_appointment":      appointment.get("endTime", ""),
+    "calender_name":                   appointment.get("calendar", ""),
+    "calendar_id":                     str(appointment.get("calendarID", "")),
+    "appointment_type":                appointment.get("type", ""),
+    "appointment_type_id":             str(appointment.get("appointmentTypeID", "")),
+    "duration_of_appointment_minutes": str(appointment.get("duration", "")),
+    "canceled":                        str(appointment.get("canceled", False)),
+    "status":                          "Canceled" if appointment.get("canceled") else "Scheduled",
+    "notes":                           appointment.get("notes", ""),
+    "referral_id":                     extract_referral_id(appointment),
+    "calender_link":                   appointment.get("confirmationPage", ""),
+    "confirmation_page_payment_link":  appointment.get("confirmationPagePaymentLink", ""),
+    "link_to_clients_confirm":         appointment.get("confirmationPage", ""),
+    "amount_paid":                     float(appointment.get("amountPaid", 0)),
+    "has_been_paid":                   appointment.get("paid", "no"),
+    "price_of_appointment":            float(appointment.get("price", 0)),
+    "price_sold":                      str(appointment.get("priceSold", "")),
+    "client_time_zone":                appointment.get("timezone", ""),
+    "calendar_timezone":               appointment.get("calendarTimezone", ""),
+    # ★ REMOVED: added_on, updated_on — both Timestamp, auto-managed by Caspio
+}
 
     async with httpx.AsyncClient(timeout=15) as client:
         try:
             check = await client.get(
                 f"{CASPIO_API_BASE_URL}/v2/tables/{CASPIO_TABLE}/records",
                 headers=headers,
-                params={"q.where": f"appointment_id={int(apt_id)}", "q.limit": 1}
+                params={"q.where": f"appointment_id='{apt_id}'", "q.limit": 1}
             )
             log.info("Caspio check status: %s", check.status_code)
             existing = check.json().get("Result", [])
@@ -250,7 +250,7 @@ async def caspio_upsert_appointment(appointment: dict):
                 resp = await client.put(
                     f"{CASPIO_API_BASE_URL}/v2/tables/{CASPIO_TABLE}/records",
                     headers=headers,
-                    params={"q.where": f"appointment_id={int(apt_id)}"},
+                    params={"q.where": f"appointment_id='{apt_id}'"},
                     json=record
                 )
                 log.info("Caspio PUT status: %s body: %s", resp.status_code, resp.text[:200])
@@ -271,7 +271,7 @@ async def caspio_mark_canceled(apt_id: int):
         await client.put(
             f"{CASPIO_API_BASE_URL}/v2/tables/{CASPIO_TABLE}/records",
             headers=headers,
-            params={"q.where": f"appointment_id={int(apt_id)}"},
+            params={"q.where": f"appointment_id='{apt_id}'"},
             json={
                 "status":     "Canceled",
                 "updated_on": datetime.utcnow().isoformat()
