@@ -637,7 +637,9 @@ async def acuity_webhook(
                 )
             log.info("Acuity fetch status: %s for ID: %s", resp.status_code, apt_id)
             if resp.status_code == 200:
-                await caspio_upsert_appointment(resp.json())
+                appointment_data = resp.json()
+                log.info("Acuity appointment forms: %s", str(appointment_data.get("forms", [])))
+                await caspio_upsert_appointment(appointment_data)
                 log.info("Caspio upsert completed for ID: %s", apt_id)
             else:
                 log.error("Acuity fetch failed: %s %s", resp.status_code, resp.text[:200])
