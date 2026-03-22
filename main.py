@@ -621,12 +621,15 @@ async def acuity_webhook(
             log.error("Cancel failed: %s", e)
 
     elif action in (
-        "scheduling.scheduled",
-        "scheduling.rescheduled",
-        "scheduling.changed",
-        "order.completed",
+    "scheduling.scheduled",
+    "scheduling.rescheduled",
+    "scheduling.changed",
+    "order.completed",
     ):
         try:
+            # ★ Wait 3 seconds — gives Acuity time to save form data
+            await asyncio.sleep(3)
+
             async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.get(
                     f"{ACUITY_BASE}/appointments/{apt_id}",
