@@ -149,24 +149,26 @@ def verify_acuity_signature(raw_body: bytes, signature: Optional[str]) -> bool:
 # --------------------------------------------------
 
 def extract_referral_id(appointment: dict) -> Optional[str]:
-    # Method 1 — structured field by ID (most reliable)
     for form in appointment.get("forms", []):
         for field in form.get("values", []):
             if field.get("fieldID") == 18222169:
                 val = str(field.get("value", "")).strip()
                 if val and len(val) < 100 and "\n" not in val:
+                    log.info("referral_id extracted: %s", val)  # ← add this
                     return val
 
-    # Method 2 — formsText regex (strict — requires colon + value on same line)
     forms_text = appointment.get("formsText", "")
     if forms_text:
         match = re.search(r"referral_id:\s*(\S+)", forms_text, re.IGNORECASE)
         if match:
             val = match.group(1).strip()
             if val and len(val) < 100:
+                log.info("referral_id extracted via formsText: %s", val)  # ← add this
                 return val
 
+    log.warning("referral_id not found in appointment %s", appointment.get("id"))
     return None
+
 
 # --------------------------------------------------
 # CASPIO SYNC HELPERS
