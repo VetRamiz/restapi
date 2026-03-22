@@ -819,71 +819,78 @@ async def availability_by_state(
             "slots":   []
         }
 
-    # calendarID → type info map (first-seen per calendar wins)
-    # Group all matched types by calendarID
-    cal_to_types = defaultdict(list)
+    # Build calendarID → LIST of all type infos
+    # Query ALL types per calendar so we catch availability regardless
+    # of which type the therapist configured their schedule against
+    cal_to_types_list = defaultdict(list)
     for apt_type in matched_types:
         for cal_id in apt_type.get("calendarIDs", []):
-            cal_to_types[cal_id].append(apt_type)
+            cal_to_types_list[cal_id].append({
+                "appointmentTypeID": apt_type["id"],
+                "schedulingUrl":     apt_type.get("schedulingUrl", ""),
+                "typeName":          apt_type.get("name", ""),
+            })
 
-    # Pick the most state-relevant type per calendar
-    calendar_type_map = {}
-    for cal_id, types in cal_to_types.items():
-        best = pick_best_type(types, state)
-        calendar_type_map[cal_id] = {
-            "appointmentTypeID": best["id"],
-            "schedulingUrl":     best.get("schedulingUrl", ""),
-            "typeName":          best.get("name", ""),
-        }
-
-    # Fetch all calendars in parallel
+    # Fetch times for ALL types per calendar in parallel
     async with httpx.AsyncClient(timeout=20) as client:
-        cal_ids = list(calendar_type_map.keys())
-        tasks = [
-            client.get(
-                f"{ACUITY_BASE}/availability/times",
-                headers=acuity_headers(),
-                params={
-                    "appointmentTypeID": calendar_type_map[cal_id]["appointmentTypeID"],
-                    "calendarID":        cal_id,
-                    "date":              date,
-                    "timezone":          timezone,
-                }
-            )
-            for cal_id in cal_ids
-        ]
+        tasks     = []
+        task_meta = []
+        for cal_id, type_infos in cal_to_types_list.items():
+            for info in type_infos:
+                tasks.append(
+                    client.get(
+                        f"{ACUITY_BASE}/availability/times",
+                        headers=acuity_headers(),
+                        params={
+                            "appointmentTypeID": info["appointmentTypeID"],
+                            "calendarID":        cal_id,
+                            "date":              date,
+                            "timezone":          timezone,
+                        }
+                    )
+                )
+                task_meta.append((cal_id, info))
         responses = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Build per-therapist groups
+    # Build per-therapist slot groups
+    # seen_slots deduplicates same (calendarID + time) across multiple types
     therapist_slots = {}
+    seen_slots      = set()
+
     for i, resp in enumerate(responses):
-        cal_id = cal_ids[i]
-        info   = calendar_type_map[cal_id]
+        cal_id, info = task_meta[i]
         if isinstance(resp, Exception) or resp.status_code != 200:
             continue
+        for slot in resp.json():
+            if slot.get("slotsAvailable", 0) < 1:
+                continue
+            slot_key = (cal_id, slot["time"])
+            if slot_key in seen_slots:
+                continue  # already found this time from another type
+            seen_slots.add(slot_key)
 
-        slots = [
-            {
+            if cal_id not in therapist_slots:
+                therapist_slots[cal_id] = {
+                    "calendarID":    cal_id,
+                    "therapistName": extract_doctor_name(info["typeName"]),
+                    "typeName":      info["typeName"],
+                    "bookingUrl":    info["schedulingUrl"],
+                    "typeID":        info["appointmentTypeID"],
+                    "slots":         [],
+                    "totalSlots":    0,
+                }
+            therapist_slots[cal_id]["slots"].append({
                 "time":          slot["time"],
                 "calendarID":    cal_id,
                 "bookingUrl":    info["schedulingUrl"],
                 "typeID":        info["appointmentTypeID"],
                 "therapistName": extract_doctor_name(info["typeName"]),
-            }
-            for slot in resp.json()
-            if slot.get("slotsAvailable", 0) >= 1
-        ]
+            })
+            therapist_slots[cal_id]["totalSlots"] += 1
 
-        if slots:
-            therapist_slots[cal_id] = {
-                "calendarID":    cal_id,
-                "therapistName": extract_doctor_name(info["typeName"]),
-                "typeName":      info["typeName"],
-                "bookingUrl":    info["schedulingUrl"],
-                "typeID":        info["appointmentTypeID"],
-                "slots":         sorted(slots, key=lambda x: x["time"]),
-                "totalSlots":    len(slots),
-            }
+    # Sort each therapist's slots by time
+    for cal_id in therapist_slots:
+        therapist_slots[cal_id]["slots"].sort(key=lambda x: x["time"])
 
     # Shuffle therapist order on every request
     therapist_list = list(therapist_slots.values())
@@ -944,39 +951,36 @@ async def availability_dates_by_state(
 
     matched_types = get_matched_types(types_resp.json(), state)
 
-    # Group all matched types by calendarID
-    cal_to_types = defaultdict(list)
-    for apt_type in matched_types:
-        for cal_id in apt_type.get("calendarIDs", []):
-            cal_to_types[cal_id].append(apt_type)
-
-    # Pick the most state-relevant type per calendar
-    calendar_type_map = {}
-    for cal_id, types in cal_to_types.items():
-        best = pick_best_type(types, state)
-        calendar_type_map[cal_id] = {
-            "appointmentTypeID": best["id"],
-            "schedulingUrl":     best.get("schedulingUrl", ""),
-            "typeName":          best.get("name", ""),
-        }
-    if not calendar_type_map:
+    if not matched_types:
         return {"state": state, "month": month, "dates": []}
 
+    # Build calendarID → LIST of all typeIDs
+    # Query ALL types per calendar — same reason as by-state above
+    cal_to_typeids = defaultdict(list)
+    for apt_type in matched_types:
+        for cal_id in apt_type.get("calendarIDs", []):
+            cal_to_typeids[cal_id].append(apt_type["id"])
+
+    if not cal_to_typeids:
+        return {"state": state, "month": month, "dates": []}
+
+    # Fetch dates for ALL types per calendar in parallel
     async with httpx.AsyncClient(timeout=20) as client:
-        cal_ids = list(calendar_type_map.keys())
-        tasks = [
-            client.get(
-                f"{ACUITY_BASE}/availability/dates",
-                headers=acuity_headers(),
-                params={
-                    "appointmentTypeID": calendar_type_map[cal_id],
-                    "calendarID":        cal_id,
-                    "month":             month,
-                    "timezone":          timezone,
-                }
-            )
-            for cal_id in cal_ids
-        ]
+        tasks = []
+        for cal_id, type_ids in cal_to_typeids.items():
+            for type_id in type_ids:
+                tasks.append(
+                    client.get(
+                        f"{ACUITY_BASE}/availability/dates",
+                        headers=acuity_headers(),
+                        params={
+                            "appointmentTypeID": type_id,
+                            "calendarID":        cal_id,
+                            "month":             month,
+                            "timezone":          timezone,
+                        }
+                    )
+                )
         responses = await asyncio.gather(*tasks, return_exceptions=True)
 
     all_dates: set = set()
@@ -993,6 +997,7 @@ async def availability_dates_by_state(
         "timezone": timezone,
         "dates":    [{"date": d} for d in sorted(all_dates)]
     }
+
 
 
 # ==================================================
