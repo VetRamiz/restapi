@@ -1096,3 +1096,22 @@ async def psypact_check(state: str = Query(...)):
     else:
         pool = "all (outside US)"
     return {"state": state, "pool": pool}
+
+@app.get("/admin/debug-appointment/{appointment_id}", tags=["Admin"])
+async def debug_appointment(appointment_id: int):
+    """Show raw forms data from Acuity for debugging referral_id extraction."""
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(
+            f"{ACUITY_BASE}/appointments/{appointment_id}",
+            headers=acuity_headers()
+        )
+    if resp.status_code != 200:
+        raise HTTPException(resp.status_code, resp.text)
+    
+    data = resp.json()
+    return {
+        "id":        data.get("id"),
+        "forms":     data.get("forms", []),
+        "formsText": data.get("formsText", ""),
+        "notes":     data.get("notes", ""),
+    }
