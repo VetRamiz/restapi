@@ -812,8 +812,31 @@ def is_all_states(apt_type: dict) -> bool:
     return is_psypact_generic(apt_type)  # ★ also catches bare THRIVE: types
 
 
-def is_psypact_state(state: str) -> bool:
-    return state not in NON_PSYPACT_STATES
+def is_psypact_eligible(apt_type: dict) -> bool:
+    """
+    Returns True if this type belongs to the PSYPACT pool.
+    Includes:
+    - Generic types with no state (THRIVE: Psychological Evaluation)
+    - Types from any state NOT in NON_PSYPACT_STATES
+    Excludes:
+    - Types specific to non-PSYPACT states (CA, NY, IA etc.)
+    """
+    cat  = apt_type.get("category", "").upper()
+    name = apt_type.get("name", "").upper()
+
+    # Always include all-states / generic types
+    if is_all_states(apt_type):
+        return True
+
+    # Check if it matches any NON-PSYPACT state — if so, exclude it
+    for non_psypact in NON_PSYPACT_STATES:
+        keywords = STATE_KEYWORDS.get(non_psypact, [non_psypact.upper()])
+        for kw in keywords:
+            if kw.upper() in cat or kw.upper() in name:
+                return False  # belongs to non-PSYPACT state → exclude
+
+    # Doesn't match any non-PSYPACT state → include in PSYPACT pool
+    return True
 
 
 def is_50min_psych_eval(apt_type: dict) -> bool:
@@ -1071,20 +1094,13 @@ async def availability_dates_by_state(
     all_types = types_resp.json()
 
     if is_psypact_state(state):
-        # ★ PSYPACT — bundle all psypact states
-        matched_types = []
-        seen_ids = set()
-        for psypact_state in PSYPACT_STATES:
-            for t in all_types:
-                if t["id"] not in seen_ids and is_50min_psych_eval(t) and matches_state(t, psypact_state):
-                    matched_types.append(t)
-                    seen_ids.add(t["id"])
-        for t in all_types:
-            if t["id"] not in seen_ids and is_50min_psych_eval(t) and is_all_states(t):
-                matched_types.append(t)
-                seen_ids.add(t["id"])
+        # ★ PSYPACT — include all types NOT specific to non-PSYPACT states
+        matched_types = [
+            t for t in all_types
+            if is_50min_psych_eval(t) and is_psypact_eligible(t)
+        ]
     else:
-        # ★ NON-PSYPACT — existing behavior
+        # ★ NON-PSYPACT — state-specific only, existing behavior
         state_types = [
             t for t in all_types
             if is_50min_psych_eval(t) and matches_state(t, state)
@@ -1099,7 +1115,6 @@ async def availability_dates_by_state(
             for t in all_states_types:
                 if t["id"] not in existing_ids:
                     matched_types.append(t)
-
     # rest stays the same...
     calendar_type_map = {}
     for apt_type in matched_types:
