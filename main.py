@@ -3,11 +3,12 @@ import base64
 import hmac
 import hashlib
 import logging
-from collections import deque
-from datetime import datetime
 import random
 import re
+from collections import deque, defaultdict
+from datetime import datetime
 from typing import Optional, List
+from urllib.parse import parse_qs
 
 import httpx
 from dotenv import load_dotenv
@@ -26,8 +27,8 @@ ACUITY_USER_ID        = os.getenv("ACUITY_USER_ID")
 ACUITY_API_KEY        = os.getenv("ACUITY_API_KEY")
 ACUITY_WEBHOOK_SECRET = os.getenv("ACUITY_WEBHOOK_SECRET")
 
-CASPIO_BASE_URL       = os.getenv("CASPIO_BASE_URL")       # for token
-CASPIO_API_BASE_URL   = os.getenv("CASPIO_API_BASE_URL")   # for records
+CASPIO_BASE_URL       = os.getenv("CASPIO_BASE_URL")        # token endpoint base
+CASPIO_API_BASE_URL   = os.getenv("CASPIO_API_BASE_URL")    # records endpoint base
 CASPIO_CLIENT_ID      = os.getenv("CASPIO_CLIENT_ID")
 CASPIO_CLIENT_SECRET  = os.getenv("CASPIO_CLIENT_SECRET")
 CASPIO_TABLE          = os.getenv("CASPIO_APPOINTMENTS_TABLE")
@@ -48,7 +49,7 @@ log = logging.getLogger("acuity-proxy")
 app = FastAPI(
     title="Acuity ↔ Caspio Proxy",
     description="Covers all Acuity availability, appointments, and Caspio sync",
-    version="2.1.0"
+    version="3.0.0"
 )
 
 app.add_middleware(
@@ -62,7 +63,7 @@ app.add_middleware(
 # GLOBAL STATE
 # --------------------------------------------------
 
-recent_webhooks     = deque(maxlen=500)   # auto-drops old entries
+recent_webhooks     = deque(maxlen=500)
 _caspio_token_cache = {}
 
 # --------------------------------------------------
@@ -78,9 +79,9 @@ class BulkAvailabilityRequest(BaseModel):
 
 class CheckTimesRequest(BaseModel):
     appointmentTypeID: int
-    calendarID: Optional[int]  = None
+    calendarID: Optional[int] = None
     datetime: str
-    timezone: Optional[str]    = "America/New_York"
+    timezone: Optional[str]   = "America/New_York"
 
 
 # --------------------------------------------------
@@ -93,7 +94,7 @@ def acuity_headers():
     ).decode()
     return {
         "Authorization": f"Basic {token}",
-        "Content-Type": "application/json"
+        "Content-Type":  "application/json"
     }
 
 
@@ -130,33 +131,29 @@ async def caspio_headers():
     token = await get_caspio_token()
     return {
         "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json"
+        "Content-Type":  "application/json"
     }
 
 
 # --------------------------------------------------
-# SECURITY HELPERS
+# SECURITY
 # --------------------------------------------------
 
-# def verify_acuity_signature(raw_body: bytes, signature: Optional[str]) -> bool:
-    if not ACUITY_WEBHOOK_SECRET:
-        return True                # skip if secret not configured
-    if not signature:
-        return False
-    expected = hmac.new(
-        ACUITY_WEBHOOK_SECRET.encode(),
-        raw_body,
-        hashlib.sha256
-    ).hexdigest()
-    return hmac.compare_digest(expected, signature)
+def verify_acuity_signature(raw_body: bytes, signature: Optional[str]) -> bool:
+    # Disabled — Acuity signing key not available in UI
+    return True
 
-def verify_acuity_signature(raw_body, signature):
-    return True  # disable until secret is confirmed
+
 # --------------------------------------------------
 # REFERRAL ID HELPER
 # --------------------------------------------------
 
 def extract_referral_id(appointment: dict) -> Optional[str]:
+    """
+    Extract referral_id from Acuity appointment forms.
+    Tries structured field (ID 18222169) first, then raw formsText fallback.
+    Returns as plain string (Text field in Caspio).
+    """
     for form in appointment.get("forms", []):
         for field in form.get("values", []):
             if (
@@ -166,7 +163,7 @@ def extract_referral_id(appointment: dict) -> Optional[str]:
                 val = field.get("value", "").strip()
                 return val if val else None
 
-    # Fallback — parse formsText
+    # Fallback — parse formsText raw string
     forms_text = appointment.get("formsText", "")
     if forms_text:
         match = re.search(
@@ -179,7 +176,6 @@ def extract_referral_id(appointment: dict) -> Optional[str]:
             return val if val else None
 
     return None
-
 
 
 # --------------------------------------------------
@@ -202,35 +198,34 @@ async def caspio_upsert_appointment(appointment: dict):
         return
 
     record = {
-    "appointment_id":                  int(apt_id),   # ← remove str(), use int()
-    "patient_first_name":              appointment.get("firstName", ""),
-    "patient_second_name":             appointment.get("lastName", ""),
-    "patient_email":                   appointment.get("email", ""),
-    "phone_number":                    appointment.get("phone", ""),
-    "date_of_appointment":             appointment.get("date", ""),
-    "time_of_appointment":             appointment.get("datetime", ""),
-    "ending_time_of_appointment":      appointment.get("endTime", ""),
-    "calender_name":                   appointment.get("calendar", ""),
-    "calendar_id":                     str(appointment.get("calendarID", "")),
-    "appointment_type":                appointment.get("type", ""),
-    "appointment_type_id":             str(appointment.get("appointmentTypeID", "")),
-    "duration_of_appointment_minutes": str(appointment.get("duration", "")),
-    "canceled":                        str(appointment.get("canceled", False)),
-    "status":                          "Canceled" if appointment.get("canceled") else "Scheduled",
-    "notes":                           appointment.get("notes", ""),
-    "referral_id": int(extract_referral_id(appointment)) if extract_referral_id(appointment) else None,
-    "calender_link":                   appointment.get("confirmationPage", ""),
-    "confirmation_page_payment_link":  appointment.get("confirmationPagePaymentLink", ""),
-    "link_to_clients_confirm":         appointment.get("confirmationPage", ""),
-    "amount_paid":                     float(appointment.get("amountPaid", 0)),
-    "has_been_paid":                   appointment.get("paid", "no"),
-    "price_of_appointment":            float(appointment.get("price", 0)),
-    "price_sold":                      str(appointment.get("priceSold", "")),
-    "client_time_zone":                appointment.get("timezone", ""),
-    "calendar_timezone":               appointment.get("calendarTimezone", ""),
-    # ★ REMOVED: added_on, date_created, datetime_created, datetime, PK_ID, ID
-    # These are auto-generated by Caspio — never write to them
-}
+        "appointment_id":                  int(apt_id),
+        "patient_first_name":              appointment.get("firstName", ""),
+        "patient_second_name":             appointment.get("lastName", ""),
+        "patient_email":                   appointment.get("email", ""),
+        "phone_number":                    appointment.get("phone", ""),
+        "date_of_appointment":             appointment.get("date", ""),
+        "time_of_appointment":             appointment.get("datetime", ""),
+        "ending_time_of_appointment":      appointment.get("endTime", ""),
+        "calender_name":                   appointment.get("calendar", ""),
+        "calendar_id":                     str(appointment.get("calendarID", "")),
+        "appointment_type":                appointment.get("type", ""),
+        "appointment_type_id":             str(appointment.get("appointmentTypeID", "")),
+        "duration_of_appointment_minutes": str(appointment.get("duration", "")),
+        "canceled":                        str(appointment.get("canceled", False)),
+        "status":                          "Canceled" if appointment.get("canceled") else "Scheduled",
+        "notes":                           appointment.get("notes", ""),
+        "referral_id":                     extract_referral_id(appointment),  # Text field
+        "calender_link":                   appointment.get("confirmationPage", ""),
+        "confirmation_page_payment_link":  appointment.get("confirmationPagePaymentLink", ""),
+        "link_to_clients_confirm":         appointment.get("confirmationPage", ""),
+        "amount_paid":                     float(appointment.get("amountPaid", 0)),
+        "has_been_paid":                   appointment.get("paid", "no"),
+        "price_of_appointment":            float(appointment.get("price", 0)),
+        "price_sold":                      str(appointment.get("priceSold", "")),
+        "client_time_zone":                appointment.get("timezone", ""),
+        "calendar_timezone":               appointment.get("calendarTimezone", ""),
+        "updated_on":                      datetime.utcnow().isoformat(),
+    }
 
     async with httpx.AsyncClient(timeout=15) as client:
         try:
@@ -239,7 +234,7 @@ async def caspio_upsert_appointment(appointment: dict):
                 headers=headers,
                 params={"q.where": f"appointment_id={int(apt_id)}", "q.limit": 1}
             )
-            log.info("Caspio check status: %s body: %s", check.status_code, check.text[:200])
+            log.info("Caspio check status: %s", check.status_code)
             existing = check.json().get("Result", [])
         except Exception as e:
             log.error("Caspio check failed: %s", e)
@@ -250,7 +245,7 @@ async def caspio_upsert_appointment(appointment: dict):
                 resp = await client.put(
                     f"{CASPIO_API_BASE_URL}/v2/tables/{CASPIO_TABLE}/records",
                     headers=headers,
-                    params={"q.where": f"appointment_id={apt_id}"},
+                    params={"q.where": f"appointment_id={int(apt_id)}"},
                     json=record
                 )
                 log.info("Caspio PUT status: %s body: %s", resp.status_code, resp.text[:200])
@@ -273,8 +268,8 @@ async def caspio_mark_canceled(apt_id: int):
             headers=headers,
             params={"q.where": f"appointment_id={int(apt_id)}"},
             json={
-                "status":      "Canceled",        # ✅ lowercase to match Caspio column
-                "updated_on":  datetime.utcnow().isoformat()
+                "status":     "Canceled",
+                "updated_on": datetime.utcnow().isoformat()
             }
         )
     log.info("Caspio marked appointment ID %s as canceled", apt_id)
@@ -285,12 +280,12 @@ async def caspio_mark_canceled(apt_id: int):
 # ==================================================
 
 # --------------------------------------------------
-# HEALTH + ROOT
+# HEALTH
 # --------------------------------------------------
 
 @app.get("/", tags=["Health"])
 async def root():
-    return {"service": "acuity-caspio-proxy", "status": "running"}
+    return {"service": "acuity-caspio-proxy", "status": "running", "version": "3.0.0"}
 
 
 @app.get("/health", tags=["Health"])
@@ -299,18 +294,17 @@ async def health():
 
 
 # --------------------------------------------------
-# CONFIGURATION ENDPOINTS
+# CONFIGURATION
 # --------------------------------------------------
 
 @app.get("/appointment-types", tags=["Configuration"])
 async def get_appointment_types(
-    calendarID: Optional[int] = Query(None, description="Filter by calendar ID")
+    calendarID: Optional[int] = Query(None)
 ):
-    """List all appointment types (raw passthrough from Acuity — no filtering applied here)."""
+    """Raw passthrough — returns all Acuity appointment types unfiltered."""
     params = {}
     if calendarID:
         params["calendarID"] = calendarID
-
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.get(
             f"{ACUITY_BASE}/appointment-types",
@@ -324,12 +318,8 @@ async def get_appointment_types(
 
 @app.get("/calendars", tags=["Configuration"])
 async def get_calendars():
-    """List all therapist calendars with their IDs. Use these IDs in availability calls."""
     async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(
-            f"{ACUITY_BASE}/calendars",
-            headers=acuity_headers()
-        )
+        resp = await client.get(f"{ACUITY_BASE}/calendars", headers=acuity_headers())
     if resp.status_code != 200:
         raise HTTPException(resp.status_code, "Unable to fetch calendars")
     return resp.json()
@@ -337,43 +327,39 @@ async def get_calendars():
 
 @app.get("/appointment-addons", tags=["Configuration"])
 async def get_appointment_addons():
-    """List all add-ons available. Use addonIDs when booking appointments."""
     async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(
-            f"{ACUITY_BASE}/appointment-addons",
-            headers=acuity_headers()
-        )
+        resp = await client.get(f"{ACUITY_BASE}/appointment-addons", headers=acuity_headers())
     if resp.status_code != 200:
         raise HTTPException(resp.status_code, "Unable to fetch addons")
     return resp.json()
 
 
+@app.get("/forms", tags=["Configuration"])
+async def get_forms():
+    """Get all Acuity form fields and their IDs."""
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(f"{ACUITY_BASE}/forms", headers=acuity_headers())
+    if resp.status_code != 200:
+        raise HTTPException(resp.status_code, resp.text)
+    return resp.json()
+
+
 # --------------------------------------------------
-# AVAILABILITY ENDPOINTS
+# AVAILABILITY — generic endpoints
 # --------------------------------------------------
 
 @app.get("/availability/dates", tags=["Availability"])
 async def available_dates(
-    appointmentTypeID: int           = Query(...,  description="Appointment type ID — get from /appointment-types"),
-    month:             str           = Query(None, description="YYYY-MM format. Defaults to current month"),
-    calendarID:        Optional[int] = Query(None, description="Specific therapist calendar ID"),
-    timezone:          str           = Query("America/New_York", description="Timezone string"),
+    appointmentTypeID: int           = Query(...),
+    month:             str           = Query(None),
+    calendarID:        Optional[int] = Query(None),
+    timezone:          str           = Query("America/New_York"),
 ):
-    """
-    GET available dates for a calendar in a given month.
-    Returns array of { date: YYYY-MM-DD } objects.
-    """
     if not month:
         month = datetime.now().strftime("%Y-%m")
-
-    params = {
-        "appointmentTypeID": appointmentTypeID,
-        "month":             month,
-        "timezone":          timezone,
-    }
+    params = {"appointmentTypeID": appointmentTypeID, "month": month, "timezone": timezone}
     if calendarID:
         params["calendarID"] = calendarID
-
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.get(
             f"{ACUITY_BASE}/availability/dates",
@@ -387,23 +373,14 @@ async def available_dates(
 
 @app.get("/availability/times", tags=["Availability"])
 async def available_times(
-    appointmentTypeID: int           = Query(..., description="Appointment type ID"),
-    date:              str           = Query(..., description="YYYY-MM-DD format"),
-    calendarID:        Optional[int] = Query(None, description="Specific therapist calendar ID"),
+    appointmentTypeID: int           = Query(...),
+    date:              str           = Query(...),
+    calendarID:        Optional[int] = Query(None),
     timezone:          str           = Query("America/New_York"),
 ):
-    """
-    GET available time slots for a specific date.
-    Returns array of { time, slotsAvailable } objects.
-    """
-    params = {
-        "appointmentTypeID": appointmentTypeID,
-        "date":              date,
-        "timezone":          timezone,
-    }
+    params = {"appointmentTypeID": appointmentTypeID, "date": date, "timezone": timezone}
     if calendarID:
         params["calendarID"] = calendarID
-
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.get(
             f"{ACUITY_BASE}/availability/times",
@@ -417,21 +394,16 @@ async def available_times(
 
 @app.get("/availability/classes", tags=["Availability"])
 async def available_classes(
-    appointmentTypeID:  Optional[int] = Query(None, description="Filter by appointment type"),
-    calendarID:         Optional[int] = Query(None, description="Filter by calendar"),
-    month:              Optional[str] = Query(None, description="YYYY-MM format"),
-    includeUnavailable: bool          = Query(False, description="Include full/unavailable classes"),
+    appointmentTypeID:  Optional[int] = Query(None),
+    calendarID:         Optional[int] = Query(None),
+    month:              Optional[str] = Query(None),
+    includeUnavailable: bool          = Query(False),
     timezone:           str           = Query("America/New_York"),
 ):
-    """GET available class/group session slots."""
-    params = {
-        "timezone":           timezone,
-        "includeUnavailable": str(includeUnavailable).lower(),
-    }
+    params = {"timezone": timezone, "includeUnavailable": str(includeUnavailable).lower()}
     if appointmentTypeID: params["appointmentTypeID"] = appointmentTypeID
     if calendarID:        params["calendarID"]        = calendarID
     if month:             params["month"]             = month
-
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.get(
             f"{ACUITY_BASE}/availability/classes",
@@ -445,10 +417,6 @@ async def available_classes(
 
 @app.post("/availability/check-times", tags=["Availability"])
 async def check_times(body: CheckTimesRequest):
-    """
-    POST to verify a specific datetime slot is still available.
-    Call this RIGHT BEFORE booking to avoid double-booking.
-    """
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.post(
             f"{ACUITY_BASE}/availability/check-times",
@@ -462,10 +430,6 @@ async def check_times(body: CheckTimesRequest):
 
 @app.post("/availability/bulk", tags=["Availability"])
 async def availability_bulk(body: BulkAvailabilityRequest):
-    """
-    Fetch available times for MULTIPLE therapist calendars at once.
-    All requests fire in parallel — fast even with 10+ therapists.
-    """
     async with httpx.AsyncClient(timeout=15) as client:
         tasks = [
             client.get(
@@ -473,29 +437,22 @@ async def availability_bulk(body: BulkAvailabilityRequest):
                 headers=acuity_headers(),
                 params={
                     "appointmentTypeID": body.appointmentTypeID,
-                    "calendarID":        calendar_id,
+                    "calendarID":        cal_id,
                     "date":              body.date,
                     "timezone":          body.timezone
                 }
             )
-            for calendar_id in body.calendarIDs
+            for cal_id in body.calendarIDs
         ]
         responses = await asyncio.gather(*tasks)
 
     results = []
     for i, resp in enumerate(responses):
-        if resp.status_code == 200:
-            results.append({
-                "calendarID": body.calendarIDs[i],
-                "slots":      resp.json()
-            })
-        else:
-            results.append({
-                "calendarID": body.calendarIDs[i],
-                "slots":      [],
-                "error":      "unable to fetch"
-            })
-
+        results.append({
+            "calendarID": body.calendarIDs[i],
+            "slots":      resp.json() if resp.status_code == 200 else [],
+            **({"error": "unable to fetch"} if resp.status_code != 200 else {})
+        })
     return {"date": body.date, "results": results}
 
 
@@ -505,21 +462,19 @@ async def availability_bulk(body: BulkAvailabilityRequest):
 
 @app.get("/appointments", tags=["Appointments"])
 async def get_appointments(
-    minDate:           Optional[str]  = Query(None, description="Min date YYYY-MM-DD"),
-    maxDate:           Optional[str]  = Query(None, description="Max date YYYY-MM-DD"),
+    minDate:           Optional[str]  = Query(None),
+    maxDate:           Optional[str]  = Query(None),
     calendarID:        Optional[int]  = Query(None),
     appointmentTypeID: Optional[int]  = Query(None),
     canceled:          Optional[bool] = Query(None),
-    max:               int            = Query(50, description="Max records to return"),
+    max:               int            = Query(50),
 ):
-    """List appointments with optional filters."""
     params: dict = {"max": max}
-    if minDate:              params["minDate"]            = minDate
-    if maxDate:              params["maxDate"]            = maxDate
-    if calendarID:           params["calendarID"]         = calendarID
-    if appointmentTypeID:    params["appointmentTypeID"]  = appointmentTypeID
-    if canceled is not None: params["canceled"]           = str(canceled).lower()
-
+    if minDate:              params["minDate"]           = minDate
+    if maxDate:              params["maxDate"]           = maxDate
+    if calendarID:           params["calendarID"]        = calendarID
+    if appointmentTypeID:    params["appointmentTypeID"] = appointmentTypeID
+    if canceled is not None: params["canceled"]          = str(canceled).lower()
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.get(
             f"{ACUITY_BASE}/appointments",
@@ -534,22 +489,8 @@ async def get_appointments(
 @app.post("/appointments", tags=["Appointments"], status_code=201)
 async def create_appointment(body: dict, background_tasks: BackgroundTasks):
     """
-    Book a new appointment. Syncs to Caspio automatically in background.
-    Pass referral_id in the fields array to track it through to Caspio:
-
-    {
-      "appointmentTypeID": 999,
-      "calendarID": 111,
-      "datetime": "2025-03-15T10:00:00-0500",
-      "firstName": "Jane",
-      "lastName": "Doe",
-      "email": "jane@example.com",
-      "fields": [
-        { "id": "YOUR_ACUITY_FIELD_ID", "value": "REF-12345" }
-      ]
-    }
-
-    Get YOUR_ACUITY_FIELD_ID from GET /forms on the Acuity API.
+    Book a new appointment. Pass referral_id via fields array:
+    { ..., "fields": [{ "id": 18222169, "value": "ZDHMRJPJ" }] }
     """
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(
@@ -559,7 +500,6 @@ async def create_appointment(body: dict, background_tasks: BackgroundTasks):
         )
     if resp.status_code not in (200, 201):
         raise HTTPException(resp.status_code, "Appointment creation failed")
-
     appointment = resp.json()
     background_tasks.add_task(caspio_upsert_appointment, appointment)
     return appointment
@@ -567,7 +507,6 @@ async def create_appointment(body: dict, background_tasks: BackgroundTasks):
 
 @app.get("/appointments/{appointment_id}", tags=["Appointments"])
 async def get_appointment(appointment_id: int):
-    """Get a single appointment by Acuity ID."""
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.get(
             f"{ACUITY_BASE}/appointments/{appointment_id}",
@@ -582,9 +521,8 @@ async def get_appointment(appointment_id: int):
 async def cancel_appointment(
     appointment_id:   int,
     background_tasks: BackgroundTasks,
-    noEmail: bool = Query(False, description="Suppress cancellation email")
+    noEmail: bool = Query(False)
 ):
-    """Cancel an appointment. Updates Caspio Status to Canceled."""
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.put(
             f"{ACUITY_BASE}/appointments/{appointment_id}/cancel",
@@ -593,7 +531,6 @@ async def cancel_appointment(
         )
     if resp.status_code != 200:
         raise HTTPException(resp.status_code, resp.text)
-
     background_tasks.add_task(caspio_mark_canceled, appointment_id)
     return resp.json()
 
@@ -604,10 +541,7 @@ async def reschedule_appointment(
     body:             dict,
     background_tasks: BackgroundTasks,
 ):
-    """
-    Reschedule to a new datetime. Updates Caspio with new date/time.
-    Body: { "datetime": "2025-03-20T11:00:00-0500" }
-    """
+    """Body: { "datetime": "2025-03-20T11:00:00-0500" }"""
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.put(
             f"{ACUITY_BASE}/appointments/{appointment_id}/reschedule",
@@ -616,7 +550,6 @@ async def reschedule_appointment(
         )
     if resp.status_code != 200:
         raise HTTPException(resp.status_code, resp.text)
-
     appointment = resp.json()
     background_tasks.add_task(caspio_upsert_appointment, appointment)
     return appointment
@@ -624,7 +557,6 @@ async def reschedule_appointment(
 
 @app.get("/appointments/{appointment_id}/payments", tags=["Appointments"])
 async def get_appointment_payments(appointment_id: int):
-    """Get payment records for a specific appointment."""
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.get(
             f"{ACUITY_BASE}/appointments/{appointment_id}/payments",
@@ -636,7 +568,7 @@ async def get_appointment_payments(appointment_id: int):
 
 
 # --------------------------------------------------
-# WEBHOOK  (replaces Zapier)
+# WEBHOOK
 # --------------------------------------------------
 
 @app.post("/webhooks/acuity", tags=["Webhooks"])
@@ -645,15 +577,25 @@ async def acuity_webhook(
     background_tasks:   BackgroundTasks,
     x_acuity_signature: Optional[str] = Header(None)
 ):
+    """
+    Register this URL in Acuity → Integrations → Webhooks.
+    Acuity sends form-encoded POST — handled correctly here.
+
+    Events:
+      scheduling.scheduled   → INSERT into Caspio
+      scheduling.rescheduled → UPDATE in Caspio
+      scheduling.changed     → UPDATE in Caspio
+      scheduling.canceled    → Mark Canceled in Caspio
+      order.completed        → UPDATE in Caspio
+    """
     raw_body = await request.body()
     log.info("Webhook raw body: %s", raw_body[:300])
 
     if not verify_acuity_signature(raw_body, x_acuity_signature):
         raise HTTPException(401, "Invalid webhook signature")
 
-    # ★ Parse as form data, not JSON
+    # Acuity sends application/x-www-form-urlencoded — NOT JSON
     try:
-        from urllib.parse import parse_qs
         parsed = parse_qs(raw_body.decode("utf-8"))
         action = parsed.get("action", [None])[0]
         apt_id = parsed.get("id", [None])[0]
@@ -704,16 +646,14 @@ async def acuity_webhook(
     return {"status": "processed", "action": action, "id": apt_id}
 
 
-
-
 # ==================================================
-# FILTERING CONSTANTS
+# FILTERING — 50-min Psych Eval
 # ==================================================
 
 PSYCH_EVAL_CATEGORY_KEYWORD = "PSYCHOLOGICAL EVALUATION"
-ALLOWED_DURATION = 50
+ALLOWED_DURATION            = 50
 
-# ★ Non-PSYPACT states — shown separately per state
+# States shown with THEIR OWN therapists only (not pooled)
 NON_PSYPACT_STATES = {
     "New York",
     "Hawaii",
@@ -726,214 +666,123 @@ NON_PSYPACT_STATES = {
     "Massachusetts",
 }
 
-# ★ STATE_KEYWORDS — built from your actual Acuity category/name patterns
+# Keywords per state — used for both non-PSYPACT filtering
+# and for excluding non-PSYPACT types from the PSYPACT pool
 STATE_KEYWORDS = {
-    # Non-PSYPACT
-    "California":     ["CALIFORNIA", "SANTA MONICA"],
-    "New York":       ["NEW YORK", "THRIVE NY", "THRIVE NEW YORK"],
-    "Hawaii":         ["HAWAII", "THRIVE HAWAII"],
-    "Alaska":         ["ALASKA", "THRIVE ALASKA"],
-    "Oregon":         ["OREGON", "THRIVE OREGON"],
-    "New Mexico":     ["NEW MEXICO", "THRIVE NEW MEXICO"],
-    "Louisiana":      ["LOUISIANA", "THRIVE LOUISIANA"],
-    "Massachusetts":  ["MASSACHUSETTS", "THRIVE MASSACHUSETTS"],
-    "Iowa":           ["IOWA", "THRIVE IOWA", "THRIVE IA"],
-
-    # PSYPACT states
-    "Indiana":        ["INDIANA", "THRIVE INDIANA"],
-    "District of Columbia": ["THRIVE DC", " DC:"],
-    "Pennsylvania":   ["PENNSYLVANIA", "THRIVE PENNSYLVANIA", "THRIVE PA"],
-    "Texas":          ["TEXAS", "THRIVE TEXAS", "THRIVE TX"],
-    "Alabama":        ["ALABAMA", "THRIVE ALABAMA"],
-    "Arizona":        ["ARIZONA", "THRIVE ARIZONA"],
-    "Arkansas":       ["ARKANSAS", "THRIVE ARKANSAS"],
-    "Colorado":       ["COLORADO", "THRIVE COLORADO"],
-    "Connecticut":    ["CONNECTICUT", "THRIVE CONNECTICUT"],
-    "Delaware":       ["DELAWARE", "THRIVE DELAWARE"],
-    "Florida":        ["FLORIDA", "THRIVE FLORIDA"],
-    "Georgia":        ["GEORGIA", "THRIVE GEORGIA"],
-    "Idaho":          ["IDAHO", "THRIVE IDAHO"],
-    "Illinois":       ["ILLINOIS", "THRIVE ILLINOIS"],
-    "Kansas":         ["KANSAS", "THRIVE KANSAS"],
-    "Kentucky":       ["KENTUCKY", "THRIVE KENTUCKY"],
-    "Maine":          ["MAINE", "THRIVE MAINE"],
-    "Maryland":       ["MARYLAND", "THRIVE MARYLAND"],
-    "Michigan":       ["MICHIGAN", "THRIVE MICHIGAN"],
-    "Minnesota":      ["MINNESOTA", "THRIVE MINNESOTA"],
-    "Missouri":       ["MISSOURI", "THRIVE MISSOURI"],
-    "Montana":        ["MONTANA", "THRIVE MONTANA"],
-    "Nebraska":       ["NEBRASKA", "THRIVE NEBRASKA"],
-    "Nevada":         ["NEVADA", "THRIVE NEVADA"],
-    "New Hampshire":  ["NEW HAMPSHIRE", "THRIVE NEW HAMPSHIRE"],
-    "New Jersey":     ["NEW JERSEY", "THRIVE NEW JERSEY"],
-    "North Carolina": ["NORTH CAROLINA", "THRIVE NORTH CAROLINA", "THRIVE NC"],
-    "North Dakota":   ["NORTH DAKOTA", "THRIVE NORTH DAKOTA"],
-    "Ohio":           ["OHIO", "THRIVE OHIO"],
-    "Oklahoma":       ["OKLAHOMA", "THRIVE OKLAHOMA"],
-    "Rhode Island":   ["RHODE ISLAND", "THRIVE RHODE ISLAND"],
-    "South Carolina": ["SOUTH CAROLINA", "THRIVE SOUTH CAROLINA"],
-    "South Dakota":   ["SOUTH DAKOTA", "THRIVE SOUTH DAKOTA"],
-    "Tennessee":      ["TENNESSEE", "THRIVE TENNESSEE"],
-    "Utah":           ["UTAH", "THRIVE UTAH"],
-    "Vermont":        ["VERMONT", "THRIVE VERMONT"],
-    "Virginia":       ["VIRGINIA", "THRIVE VIRGINIA"],
-    "Washington":     ["WASHINGTON", "THRIVE WASHINGTON"],
-    "West Virginia":  ["WEST VIRGINIA", "THRIVE WEST VIRGINIA"],
-    "Wisconsin":      ["WISCONSIN", "THRIVE WISCONSIN"],
-    "Wyoming":        ["WYOMING", "THRIVE WYOMING", "(WY)"],
+    "California":           ["CALIFORNIA", "SANTA MONICA"],
+    "New York":             ["NEW YORK", "THRIVE NY"],
+    "Hawaii":               ["HAWAII"],
+    "Alaska":               ["ALASKA"],
+    "Oregon":               ["OREGON"],
+    "New Mexico":           ["NEW MEXICO"],
+    "Louisiana":            ["LOUISIANA"],
+    "Massachusetts":        ["MASSACHUSETTS"],
+    "Iowa":                 ["IOWA", "THRIVE IA"],
+    "Indiana":              ["INDIANA"],
+    "Pennsylvania":         ["PENNSYLVANIA"],
+    "Texas":                ["TEXAS", "THRIVE TX"],
+    "District of Columbia": ["THRIVE DC"],
 }
-
-# ★ These category patterns = available to ALL PSYPACT states
-# "THRIVE: Psychological Evaluation" (bare, no state) = PSYPACT pool
-ALL_STATES_KEYWORDS = [
-    "ALL STATES",
-    "THRIVE ONLINE",
-    "PSYPACT",
-    "THRIVE PSYPACT",
-]
-
-# ★ Bare "THRIVE: Psychological Evaluation" = PSYPACT pool
-# detected separately via is_psypact_generic()
-def is_psypact_generic(apt_type: dict) -> bool:
-    """
-    Returns True for types with category exactly 'THRIVE: Psychological Evaluation'
-    — no state specified — available to all PSYPACT states.
-    """
-    category = apt_type.get("category", "").upper().strip()
-    return category == "THRIVE: PSYCHOLOGICAL EVALUATION"
-
-
-def is_all_states(apt_type: dict) -> bool:
-    """Returns True if type serves all states (PSYPACT pool)."""
-    cat = apt_type.get("category", "").upper()
-    for kw in ALL_STATES_KEYWORDS:
-        if kw.upper() in cat:
-            return True
-    return is_psypact_generic(apt_type)  # ★ also catches bare THRIVE: types
-
-
-def is_psypact_eligible(apt_type: dict) -> bool:
-    """
-    Returns True if this type belongs to the PSYPACT pool.
-    Includes:
-    - Generic types with no state (THRIVE: Psychological Evaluation)
-    - Types from any state NOT in NON_PSYPACT_STATES
-    Excludes:
-    - Types specific to non-PSYPACT states (CA, NY, IA etc.)
-    """
-    cat  = apt_type.get("category", "").upper()
-    name = apt_type.get("name", "").upper()
-
-    # Always include all-states / generic types
-    if is_all_states(apt_type):
-        return True
-
-    # Check if it matches any NON-PSYPACT state — if so, exclude it
-    for non_psypact in NON_PSYPACT_STATES:
-        keywords = STATE_KEYWORDS.get(non_psypact, [non_psypact.upper()])
-        for kw in keywords:
-            if kw.upper() in cat or kw.upper() in name:
-                return False  # belongs to non-PSYPACT state → exclude
-
-    # Doesn't match any non-PSYPACT state → include in PSYPACT pool
-    return True
 
 
 def is_50min_psych_eval(apt_type: dict) -> bool:
     """
-    Returns True only for 50-minute Psychological Evaluations with a calendar assigned.
-    Handles both string '50' and integer 50 from Acuity API.
+    Core filter:
+    - Category must contain 'PSYCHOLOGICAL EVALUATION'
+    - Duration must be exactly 50 (handles string or int)
+    - Must have at least one calendarID assigned
     """
     category = apt_type.get("category", "").upper()
     duration  = apt_type.get("duration")
 
     if PSYCH_EVAL_CATEGORY_KEYWORD not in category:
         return False
-
-    # ★ Handle both "50" string and 50 integer
     try:
         if int(duration) != ALLOWED_DURATION:
             return False
     except (TypeError, ValueError):
         return False
-
-    # Must have at least one calendar assigned
     if not apt_type.get("calendarIDs"):
         return False
-
     return True
 
 
 def matches_state(apt_type: dict, state: str) -> bool:
-    """Returns True if this appointment type serves the given state."""
+    """True if type's category or name contains any keyword for the given state."""
     cat  = apt_type.get("category", "").upper()
     name = apt_type.get("name", "").upper()
-
-    keywords = STATE_KEYWORDS.get(state, [state.upper()])
-    for kw in keywords:
+    for kw in STATE_KEYWORDS.get(state, [state.upper()]):
         if kw.upper() in cat or kw.upper() in name:
             return True
     return False
 
 
-def is_all_states(apt_type: dict) -> bool:
-    """Returns True if this appointment type serves all states."""
-    cat = apt_type.get("category", "").upper()
-    for kw in ALL_STATES_KEYWORDS:
-        if kw.upper() in cat:
+def is_non_psypact_type(apt_type: dict) -> bool:
+    """True if this type is specific to a non-PSYPACT state."""
+    for state in NON_PSYPACT_STATES:
+        if matches_state(apt_type, state):
             return True
     return False
+
+
+def get_matched_types(all_types: list, state: str) -> list:
+    """
+    Three-way routing:
+
+    1. NON-PSYPACT state (CA, NY, IA etc.)
+       → only types matching that specific state
+
+    2. PSYPACT / other US state
+       → all types NOT belonging to a non-PSYPACT state
+       → includes: generic 'THRIVE: Psychological Evaluation' types
+       → includes: Indiana, DC, PA, TX specific types
+       → excludes: CA, NY, IA, OR etc.
+
+    3. Outside US (any unrecognized location)
+       → ALL 50-min psych eval types, no filter
+    """
+    eligible = [t for t in all_types if is_50min_psych_eval(t)]
+
+    # Case 1 — non-PSYPACT state
+    if state in NON_PSYPACT_STATES:
+        return [t for t in eligible if matches_state(t, state)]
+
+    # Case 2 — known US state → PSYPACT pool
+    all_known_states = set(STATE_KEYWORDS.keys()) | NON_PSYPACT_STATES
+    if state in all_known_states:
+        return [t for t in eligible if not is_non_psypact_type(t)]
+
+    # Case 3 — outside US or unrecognized → all therapists
+    return eligible
+
+
+def extract_doctor_name(type_name: str) -> str:
+    """'...with Dr. Tamara Rumburg' → 'Dr. Tamara Rumburg'"""
+    if " with " in type_name:
+        return type_name.split(" with ")[-1].strip()
+    return type_name
 
 
 # ==================================================
 # STATE-BASED AVAILABILITY ROUTES
 # ==================================================
-# --------------------------------------------------
-# PSYPACT CONFIGURATION
-# --------------------------------------------------
-
-NON_PSYPACT_STATES = {
-    "New York",
-    "Hawaii",
-    "Iowa",
-    "Alaska",
-    "Oregon",
-    "New Mexico",
-    "Louisiana",
-    "California",
-    "Massachusetts",
-}
-
-PSYPACT_STATES = {
-    "Alabama", "Arizona", "Arkansas", "Colorado", "Connecticut",
-    "Delaware", "Florida", "Georgia", "Idaho", "Illinois",
-    "Indiana", "Kansas", "Kentucky", "Maine", "Maryland",
-    "Michigan", "Minnesota", "Missouri", "Montana", "Nebraska",
-    "Nevada", "New Hampshire", "New Jersey", "North Carolina",
-    "North Dakota", "Ohio", "Oklahoma", "Pennsylvania", "Rhode Island",
-    "South Carolina", "South Dakota", "Tennessee", "Texas", "Utah",
-    "Vermont", "Virginia", "Washington", "West Virginia", "Wisconsin",
-    "Wyoming",
-}
-
-def is_psypact_state(state: str) -> bool:
-    return state not in NON_PSYPACT_STATES
-
-def extract_doctor_name(type_name: str) -> str:
-    """Extract doctor name from appointment type name.
-    e.g. 'Thrive Santa Monica: 50 Minute Online Psychological Evaluation with Dr. Tamara Rumburg'
-    → 'Dr. Tamara Rumburg'
-    """
-    if " with " in type_name:
-        return type_name.split(" with ")[-1].strip()
-    return type_name
 
 @app.get("/availability/by-state", tags=["Availability"])
 async def availability_by_state(
-    state:    str = Query(..., description="Full state name e.g. 'California', 'New York'"),
+    state:    str = Query(..., description="US state name, or any value for outside US"),
     date:     str = Query(..., description="YYYY-MM-DD"),
     timezone: str = Query("America/New_York"),
 ):
+    """
+    ★ MAIN CASPIO ENDPOINT
+
+    Routing:
+    - Non-PSYPACT (CA, NY, IA etc.) → state-specific therapists only
+    - PSYPACT state (Indiana, TX etc.) → full PSYPACT therapist pool
+    - Outside US → all therapists, no filter
+
+    Response includes 'pool' field: 'state-specific' | 'psypact' | 'all'
+    """
     async with httpx.AsyncClient(timeout=15) as client:
         types_resp = await client.get(
             f"{ACUITY_BASE}/appointment-types",
@@ -942,50 +791,17 @@ async def availability_by_state(
     if types_resp.status_code != 200:
         raise HTTPException(500, "Could not fetch appointment types")
 
-    all_types = types_resp.json()
-
-    if is_psypact_state(state):
-        # ★ PSYPACT — bundle ALL psypact state types together
-        matched_types = []
-        seen_ids = set()
-        for psypact_state in PSYPACT_STATES:
-            for t in all_types:
-                if t["id"] not in seen_ids and is_50min_psych_eval(t) and matches_state(t, psypact_state):
-                    matched_types.append(t)
-                    seen_ids.add(t["id"])
-        # also add all-states types
-        for t in all_types:
-            if t["id"] not in seen_ids and is_50min_psych_eval(t) and is_all_states(t):
-                matched_types.append(t)
-                seen_ids.add(t["id"])
-    else:
-        # ★ NON-PSYPACT — existing behavior, state-specific only
-        state_types = [
-            t for t in all_types
-            if is_50min_psych_eval(t) and matches_state(t, state)
-        ]
-        all_states_types = [
-            t for t in all_types
-            if is_50min_psych_eval(t) and is_all_states(t)
-        ]
-        matched_types = state_types if state_types else all_states_types
-        if state_types and all_states_types:
-            existing_ids = {t["id"] for t in state_types}
-            for t in all_states_types:
-                if t["id"] not in existing_ids:
-                    matched_types.append(t)
+    matched_types = get_matched_types(types_resp.json(), state)
 
     if not matched_types:
         return {
             "state":   state,
             "date":    date,
-            "message": "No 50-minute Psychological Evaluation types found for this state",
+            "message": "No 50-minute Psychological Evaluation types found",
             "slots":   []
         }
 
-    # rest of the function stays exactly the same...
-    # (calendar_type_map, parallel fetch, merge slots, shuffle, sort)
-
+    # calendarID → type info map (first-seen per calendar wins)
     calendar_type_map = {}
     for apt_type in matched_types:
         for cal_id in apt_type.get("calendarIDs", []):
@@ -996,6 +812,7 @@ async def availability_by_state(
                     "typeName":          apt_type.get("name", ""),
                 }
 
+    # Fetch all calendars in parallel
     async with httpx.AsyncClient(timeout=20) as client:
         cal_ids = list(calendar_type_map.keys())
         tasks = [
@@ -1013,7 +830,7 @@ async def availability_by_state(
         ]
         responses = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Build per-therapist slot groups
+    # Build per-therapist groups
     therapist_slots = {}
     for i, resp in enumerate(responses):
         cal_id = cal_ids[i]
@@ -1021,17 +838,17 @@ async def availability_by_state(
         if isinstance(resp, Exception) or resp.status_code != 200:
             continue
 
-        slots = []
-        for slot in resp.json():
-            if slot.get("slotsAvailable", 0) < 1:
-                continue
-            slots.append({
+        slots = [
+            {
                 "time":          slot["time"],
                 "calendarID":    cal_id,
                 "bookingUrl":    info["schedulingUrl"],
                 "typeID":        info["appointmentTypeID"],
                 "therapistName": extract_doctor_name(info["typeName"]),
-            })
+            }
+            for slot in resp.json()
+            if slot.get("slotsAvailable", 0) >= 1
+        ]
 
         if slots:
             therapist_slots[cal_id] = {
@@ -1048,38 +865,48 @@ async def availability_by_state(
     therapist_list = list(therapist_slots.values())
     random.shuffle(therapist_list)
 
-    # ★ Interleave slots by time across therapists so same-time
-    # slots from different therapists are mixed, not blocked together
-    # e.g. 9am-BeverlyIbeh, 9am-MeganCannon, 10am-BeverlyIbeh ...
-    from collections import defaultdict
+    # Interleave by time — within same timeslot therapists are shuffled
     time_buckets = defaultdict(list)
     for therapist in therapist_list:
         for slot in therapist["slots"]:
             time_buckets[slot["time"]].append(slot)
 
-    # Within each time bucket therapists are already shuffled above
-    # so just flatten sorted by time
     all_slots = []
     for time_key in sorted(time_buckets.keys()):
         all_slots.extend(time_buckets[time_key])
+
+    # Determine pool label
+    all_known = set(STATE_KEYWORDS.keys()) | NON_PSYPACT_STATES
+    if state in NON_PSYPACT_STATES:
+        pool = "state-specific"
+    elif state in all_known:
+        pool = "psypact"
+    else:
+        pool = "all"
 
     return {
         "state":          state,
         "date":           date,
         "timezone":       timezone,
+        "pool":           pool,
         "totalSlots":     len(all_slots),
         "matchedTypes":   len(matched_types),
         "totalCalendars": len(therapist_slots),
-        "therapists":     therapist_list,  # grouped view — use in Caspio to show per-therapist
-        "slots":          all_slots        # flat interleaved view — shuffled within each time
+        "therapists":     therapist_list,
+        "slots":          all_slots
     }
+
 
 @app.get("/availability/dates-by-state", tags=["Availability"])
 async def availability_dates_by_state(
-    state:    str           = Query(..., description="Full state name"),
+    state:    str           = Query(..., description="US state name, or any value for outside US"),
     month:    Optional[str] = Query(None, description="YYYY-MM. Defaults to current month"),
     timezone: str           = Query("America/New_York"),
 ):
+    """
+    Get available DATES for 50-min Psych Evals. Same routing as /availability/by-state.
+    Caspio calls this first to show date chips to the patient.
+    """
     if not month:
         month = datetime.now().strftime("%Y-%m")
 
@@ -1091,31 +918,8 @@ async def availability_dates_by_state(
     if types_resp.status_code != 200:
         raise HTTPException(500, "Could not fetch appointment types")
 
-    all_types = types_resp.json()
+    matched_types = get_matched_types(types_resp.json(), state)
 
-    if is_psypact_state(state):
-        # ★ PSYPACT — include all types NOT specific to non-PSYPACT states
-        matched_types = [
-            t for t in all_types
-            if is_50min_psych_eval(t) and is_psypact_eligible(t)
-        ]
-    else:
-        # ★ NON-PSYPACT — state-specific only, existing behavior
-        state_types = [
-            t for t in all_types
-            if is_50min_psych_eval(t) and matches_state(t, state)
-        ]
-        all_states_types = [
-            t for t in all_types
-            if is_50min_psych_eval(t) and is_all_states(t)
-        ]
-        matched_types = state_types if state_types else all_states_types
-        if state_types and all_states_types:
-            existing_ids = {t["id"] for t in state_types}
-            for t in all_states_types:
-                if t["id"] not in existing_ids:
-                    matched_types.append(t)
-    # rest stays the same...
     calendar_type_map = {}
     for apt_type in matched_types:
         for cal_id in apt_type.get("calendarIDs", []):
@@ -1157,12 +961,15 @@ async def availability_dates_by_state(
         "dates":    [{"date": d} for d in sorted(all_dates)]
     }
 
-#Temporary code..
+
+# ==================================================
+# ADMIN / DEBUG
+# ==================================================
+
 @app.get("/admin/test-caspio", tags=["Admin"])
 async def test_caspio():
-    """Test Caspio connection and return token status."""
+    """Test Caspio token and table connectivity."""
     try:
-        token = await get_caspio_token()
         headers = await caspio_headers()
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
@@ -1171,20 +978,78 @@ async def test_caspio():
                 params={"q.limit": 1}
             )
         return {
-            "caspio_token": "ok",
+            "caspio_token":      "ok",
+            "table_name":        CASPIO_TABLE,
             "table_ping_status": resp.status_code,
-            "table_ping_body": resp.json()
+            "table_ping_body":   resp.json()
         }
     except Exception as e:
         return {"error": str(e)}
-    
+
+
+@app.get("/admin/debug-types", tags=["Admin"])
+async def debug_types(state: Optional[str] = Query(None)):
+    """Show which types pass the 50-min psych eval filter and why others fail."""
+    async with httpx.AsyncClient(timeout=15) as client:
+        types_resp = await client.get(
+            f"{ACUITY_BASE}/appointment-types",
+            headers=acuity_headers()
+        )
+    all_types = types_resp.json()
+
+    passed, failed = [], []
+    for t in all_types:
+        category = t.get("category", "").upper()
+        duration  = t.get("duration")
+        reasons   = []
+
+        if PSYCH_EVAL_CATEGORY_KEYWORD not in category:
+            reasons.append(f"category missing 'PSYCHOLOGICAL EVALUATION': {t.get('category')}")
+        try:
+            if int(duration) != ALLOWED_DURATION:
+                reasons.append(f"duration {duration} != 50")
+        except Exception:
+            reasons.append(f"invalid duration: {duration}")
+        if not t.get("calendarIDs"):
+            reasons.append("no calendarIDs assigned")
+
+        entry = {
+            "id":       t["id"],
+            "name":     t.get("name", ""),
+            "category": t.get("category", ""),
+            "duration": duration,
+            "calendars": t.get("calendarIDs", []),
+        }
+        if reasons:
+            entry["filtered_reason"] = reasons
+            failed.append(entry)
+        else:
+            if state:
+                entry["matches_state"]   = matches_state(t, state)
+                entry["is_non_psypact"]  = is_non_psypact_type(t)
+                entry["in_psypact_pool"] = not is_non_psypact_type(t)
+            passed.append(entry)
+
+    matched = get_matched_types(all_types, state) if state else []
+
+    return {
+        "total_types":        len(all_types),
+        "passed_base_filter": len(passed),
+        "failed_base_filter": len(failed),
+        "matched_for_state":  len(matched) if state else "no state provided",
+        "passed":             passed,
+        "failed":             failed,
+    }
 
 
 @app.get("/states/psypact-check", tags=["Configuration"])
 async def psypact_check(state: str = Query(...)):
-    """Check if a state is PSYPACT or non-PSYPACT."""
-    return {
-        "state":      state,
-        "is_psypact": is_psypact_state(state),
-        "pool":       "psypact" if is_psypact_state(state) else "state-specific"
-    }
+    """Check routing pool for a given state."""
+    all_known = set(STATE_KEYWORDS.keys()) | NON_PSYPACT_STATES
+    if state in NON_PSYPACT_STATES:
+        pool = "state-specific"
+    elif state in all_known:
+        pool = "psypact"
+    else:
+        pool = "all (outside US)"
+    return {"state": state, "pool": pool}
