@@ -600,15 +600,21 @@ async def acuity_webhook(
         raise HTTPException(401, "Invalid webhook signature")
 
     # Acuity sends application/x-www-form-urlencoded — NOT JSON
+    # Accept both form-encoded (real Acuity) and JSON (manual curl testing)
     try:
-        parsed = parse_qs(raw_body.decode("utf-8"))
-        action = parsed.get("action", [None])[0]
-        apt_id = parsed.get("id", [None])[0]
+        content_type = request.headers.get("content-type", "")
+        if "application/json" in content_type:
+            data = await request.json()
+            action = data.get("action")
+            apt_id = str(data.get("id", "")) or None
+        else:
+            parsed = parse_qs(raw_body.decode("utf-8"))
+            action = parsed.get("action", [None])[0]
+            apt_id = parsed.get("id", [None])[0]
         log.info("Parsed action=%s id=%s", action, apt_id)
     except Exception as e:
         log.error("Failed to parse webhook body: %s", e)
         raise HTTPException(400, "Invalid payload")
-
     if not apt_id:
         return {"status": "ignored", "reason": "no appointment id"}
 
