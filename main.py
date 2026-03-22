@@ -152,36 +152,21 @@ def extract_referral_id(appointment: dict) -> Optional[str]:
     # Method 1 — structured field by ID (most reliable)
     for form in appointment.get("forms", []):
         for field in form.get("values", []):
-            if (
-                field.get("fieldID") == 18222169
-                or field.get("name", "").lower() == "referral_id"
-            ):
-                val = field.get("value", "").strip()
-                # Guard — reject if it looks like a full form dump
+            if field.get("fieldID") == 18222169:
+                val = str(field.get("value", "")).strip()
                 if val and len(val) < 100 and "\n" not in val:
                     return val
 
-    # Method 2 — parse formsText
-    # Acuity format:
-    # referral_id
-    # ============
-    # referral_id: TEST-REF-001   ← we want only this value
+    # Method 2 — formsText regex (strict — requires colon + value on same line)
     forms_text = appointment.get("formsText", "")
     if forms_text:
-        # Require colon — skips the header line, matches value line only
-        match = re.search(
-            r"referral_id:\s*([^\n\r]+)",
-            forms_text,
-            re.IGNORECASE
-        )
+        match = re.search(r"referral_id:\s*(\S+)", forms_text, re.IGNORECASE)
         if match:
             val = match.group(1).strip()
             if val and len(val) < 100:
                 return val
 
     return None
-
-
 
 # --------------------------------------------------
 # CASPIO SYNC HELPERS
