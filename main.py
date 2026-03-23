@@ -207,6 +207,7 @@ async def caspio_upsert_appointment(appointment: dict):
     "status":                          "Canceled" if appointment.get("canceled") else "Scheduled",
     "notes":                           appointment.get("notes", ""),
     "referral_id":                     extract_referral_id(appointment),
+    "clinic_id":                       extract_clinic_id(appointment),
     "calender_link":                   appointment.get("confirmationPage", ""),
     "confirmation_page_payment_link":  appointment.get("confirmationPagePaymentLink", ""),
     "link_to_clients_confirm":         appointment.get("confirmationPage", ""),
@@ -788,6 +789,19 @@ def extract_doctor_name(type_name: str) -> str:
     if " with " in type_name:
         return type_name.split(" with ")[-1].strip()
     return type_name
+
+def extract_clinic_id(appointment: dict) -> Optional[str]:
+    """Extract clinic_id from Acuity form field."""
+    for form in appointment.get("forms", []):
+        for field in form.get("values", []):
+            if (
+                field.get("fieldID") == 18236523  # replace with actual ID
+                or field.get("name", "").lower() == "clinic_id"
+            ):
+                val = str(field.get("value", "")).strip()
+                if val and len(val) < 100 and "\n" not in val:
+                    return val
+    return None
 
 
 # ==================================================
