@@ -737,8 +737,56 @@ def matches_state(apt_type: dict, state: str) -> bool:
     return False
 
 
+# --------------------------------------------------
+# CALENDAR → STATE MAP
+# Source of truth for routing. Overrides keyword matching.
+# Calendars mapped to None = PSYPACT generic (no state restriction).
+# Calendars NOT in this map fall through to dynamic keyword matching.
+# --------------------------------------------------
+
+CALENDAR_STATE_MAP: dict[int, str | None] = {
+    # ── California (non-PSYPACT) ──────────────────────────────────────
+    7409433:  "California",   # Dr. Tamara Rumburg  (Thrive Santa Monica)
+    8894649:  "California",   # Dr. Megan Cannon    ← THE BUG FIX
+    3522898:  "California",   # Dr. Emily Hu        (Thrive Santa Monica)
+    7083363:  "California",   # Dr. Beverly Ibeh
+
+    # ── Multi-state / PSYPACT pool ────────────────────────────────────
+    # 1565153: Dr. Charlynn Ruan — has types in CA, IA, TX, and PSYPACT.
+    #   DO NOT map this calendar to a single state.
+    #   Let keyword matching handle her per appointment-type name.
+
+    # 10171989: Dr. Jennifer Alpert — DC, IN, IA, PA, and PSYPACT generic.
+    #   Same reason — keyword matching handles per type name correctly.
+
+    # ── PSYPACT generic ───────────────────────────────────────────────
+    11762120: None,           # Dr. Courtney Cook, PhD
+    12453641: None,           # Dr. Bethany Young
+    12453652: None,           # Dr. Danielle Powers
+    12935263: None,           # Dr. Yessenia Castillo
+    13500779: None,           # Dr. Jacqueline Herrera
+}
+
+
 def is_non_psypact_type(apt_type: dict) -> bool:
-    """True if this type is specific to a non-PSYPACT state."""
+    """
+    Returns True if this type belongs to a non-PSYPACT state
+    (meaning it should NOT appear in the PSYPACT pool).
+
+    Priority:
+    1. Check CALENDAR_STATE_MAP for any calendarID on this type.
+       - Mapped to a state name  → non-PSYPACT (True)
+       - Mapped to None          → PSYPACT generic (False)
+       - Not in map              → fall through to keyword matching
+    2. Keyword matching on category + name (existing logic, unchanged).
+    """
+    for cal_id in apt_type.get("calendarIDs", []):
+        if cal_id in CALENDAR_STATE_MAP:
+            mapped = CALENDAR_STATE_MAP[cal_id]
+            # None means explicitly PSYPACT generic
+            return mapped is not None and mapped in NON_PSYPACT_STATES
+
+    # Fallback — dynamic keyword matching for any new type not in the map
     for state in NON_PSYPACT_STATES:
         if matches_state(apt_type, state):
             return True
