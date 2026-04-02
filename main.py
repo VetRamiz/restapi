@@ -883,6 +883,7 @@ async def availability_by_state(
     Response includes 'pool' field: 'state-specific' | 'psypact' | 'all'
     
     """
+    state = state.strip().title()
     state = STATE_NORMALIZER.get(state.strip().lower(), state.strip())
     async with httpx.AsyncClient(timeout=15) as client:
         types_resp = await client.get(
