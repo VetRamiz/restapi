@@ -714,7 +714,11 @@ CALENDAR_STATE_MAP: dict = {
     # keyword matching on type name handles them correctly.
 }
 
-
+# appointmentTypeID → the ONE state it must only appear in
+# These are types where Acuity category/name cannot be trusted
+STATE_LOCKED_TYPES: dict = {
+    52823893: "California",   # Dr. Megan Cannon — leaks into PSYPACT pool
+}
 def is_non_psypact_type(apt_type: dict) -> bool:
     # Step 1 — calendar map wins over everything
     for cal_id in apt_type.get("calendarIDs", []):
@@ -787,6 +791,12 @@ def get_matched_types(all_types: list, state: str) -> list:
     3. Outside US (any unrecognized location)
        → ALL 50-min psych eval types, no filter
     """
+    # Hard lock — these type IDs only appear for their assigned state
+    def state_lock_passes(apt_type: dict) -> bool:
+        locked_to = STATE_LOCKED_TYPES.get(apt_type["id"])
+        if locked_to is None:
+            return True           # not locked, proceed normally
+        return locked_to == state # locked — only passes if state matches exactly
     eligible = [t for t in all_types if is_50min_psych_eval(t)]
 
     # Case 1 — non-PSYPACT state
