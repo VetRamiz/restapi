@@ -746,10 +746,10 @@ def matches_state(apt_type: dict, state: str) -> bool:
 
 CALENDAR_STATE_MAP: dict[int, str | None] = {
     # ── California (non-PSYPACT) ──────────────────────────────────────
-    67331536:  "California",   # Dr. Tamara Rumburg  (Thrive Santa Monica)
-    52823893:  "California",   # Dr. Megan Cannon    ← THE BUG FIX
-    55211731:  "California",   # Dr. Emily Hu        (Thrive Santa Monica)
-    44643246:  "California",   # Dr. Beverly Ibeh
+    7409433:  "California",   # Dr. Tamara Rumburg  (Thrive Santa Monica)
+    8894649:  "California",   # Dr. Megan Cannon    ← THE BUG FIX
+    3522898:  "California",   # Dr. Emily Hu        (Thrive Santa Monica)
+    7083363:  "California",   # Dr. Beverly Ibeh
 
     # ── Multi-state / PSYPACT pool ────────────────────────────────────
     # 1565153: Dr. Charlynn Ruan — has types in CA, IA, TX, and PSYPACT.
