@@ -746,10 +746,10 @@ def matches_state(apt_type: dict, state: str) -> bool:
 
 CALENDAR_STATE_MAP: dict[int, str | None] = {
     # ── California (non-PSYPACT) ──────────────────────────────────────
-    7409433:  "California",   # Dr. Tamara Rumburg  (Thrive Santa Monica)
-    8894649:  "California",   # Dr. Megan Cannon    ← THE BUG FIX
-    3522898:  "California",   # Dr. Emily Hu        (Thrive Santa Monica)
-    7083363:  "California",   # Dr. Beverly Ibeh
+    67331536:  "California",   # Dr. Tamara Rumburg  (Thrive Santa Monica)
+    52823893:  "California",   # Dr. Megan Cannon    ← THE BUG FIX
+    55211731:  "California",   # Dr. Emily Hu        (Thrive Santa Monica)
+    44643246:  "California",   # Dr. Beverly Ibeh
 
     # ── Multi-state / PSYPACT pool ────────────────────────────────────
     # 1565153: Dr. Charlynn Ruan — has types in CA, IA, TX, and PSYPACT.
@@ -760,11 +760,11 @@ CALENDAR_STATE_MAP: dict[int, str | None] = {
     #   Same reason — keyword matching handles per type name correctly.
 
     # ── PSYPACT generic ───────────────────────────────────────────────
-    11762120: None,           # Dr. Courtney Cook, PhD
-    12453641: None,           # Dr. Bethany Young
-    12453652: None,           # Dr. Danielle Powers
-    12935263: None,           # Dr. Yessenia Castillo
-    13500779: None,           # Dr. Jacqueline Herrera
+    75932446: None,           # Dr. Courtney Cook, PhD
+    81046199: None,           # Dr. Bethany Young
+    81046572: None,           # Dr. Danielle Powers
+    84889378: None,           # Dr. Yessenia Castillo
+    88803811: None,           # Dr. Jacqueline Herrera
 }
 
 
