@@ -679,7 +679,7 @@ NON_PSYPACT_STATES = {
 # Keywords per state — used for both non-PSYPACT filtering
 # and for excluding non-PSYPACT types from the PSYPACT pool
 STATE_KEYWORDS = {
-    "California":           ["CALIFORNIA", "SANTA MONICA"],
+    "California":           ["CALIFORNIA", "SANTA MONICA","THRIVE CALIFORNIA"],
     "New York":             ["NEW YORK", "THRIVE NY"],
     "Hawaii":               ["HAWAII"],
     "Alaska":               ["ALASKA"],
