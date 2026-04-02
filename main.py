@@ -663,6 +663,8 @@ async def acuity_webhook(
 PSYCH_EVAL_CATEGORY_KEYWORD = "PSYCHOLOGICAL EVALUATION"
 ALLOWED_DURATION            = 50
 
+
+
 # States shown with THEIR OWN therapists only (not pooled)
 NON_PSYPACT_STATES = {
     "New York",
@@ -693,6 +695,14 @@ STATE_KEYWORDS = {
     "Texas":                ["TEXAS", "THRIVE TX"],
     "District of Columbia": ["THRIVE DC"],
 }
+# Create a mapping of lowercase states to their proper casing
+STATE_NORMALIZER = {}
+
+for s in NON_PSYPACT_STATES:
+    STATE_NORMALIZER[s.lower()] = s
+
+for s in STATE_KEYWORDS:
+    STATE_NORMALIZER[s.lower()] = s
 
 
 def is_50min_psych_eval(apt_type: dict) -> bool:
@@ -823,7 +833,9 @@ async def availability_by_state(
     - Outside US → all therapists, no filter
 
     Response includes 'pool' field: 'state-specific' | 'psypact' | 'all'
+    
     """
+    state = STATE_NORMALIZER.get(state.strip().lower(), state.strip())
     async with httpx.AsyncClient(timeout=15) as client:
         types_resp = await client.get(
             f"{ACUITY_BASE}/appointment-types",
