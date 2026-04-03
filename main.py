@@ -796,6 +796,7 @@ STATE_TYPE_IDS: dict[str, str] = {
     "Michigan":       _PSYPACT_GENERIC,
     "Minnesota":      _PSYPACT_GENERIC,
     "Missouri":       _PSYPACT_GENERIC,
+    "Massachusetts":  _PSYPACT_GENERIC,
     "Nebraska":       _PSYPACT_GENERIC,
     "Nevada":         _PSYPACT_GENERIC,
     "New Hampshire":  _PSYPACT_GENERIC,
@@ -817,7 +818,7 @@ STATE_TYPE_IDS: dict[str, str] = {
 # Convenience set for pool-label logic
 NON_PSYPACT_STATES: set[str] = {
     "California", "New York", "Hawaii", "Alaska", "Oregon",
-    "New Mexico", "Louisiana", "Massachusetts",
+    "New Mexico", "Louisiana",
     # Iowa and Texas have specific therapists but are not PSYPACT-compact states
     "Iowa", "Texas",
     # Non-PSYPACT-compact states that still get the generic PSYPACT pool
