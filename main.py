@@ -872,11 +872,12 @@ async def availability_by_state(
     typeIDs:  Optional[str] = Query(None),   # ← new param, Caspio can pass this optionally
 ):
     state = STATE_NORMALIZER.get(state.strip().lower(), state.strip())
-
+    log.info("by-state called — state=%s typeIDs_param=%s", state, typeIDs)  # ← ADD THIS
     # If typeIDs not passed, look up from Caspio State_TypeID_Map table
     if not typeIDs:
+        log.info("No typeIDs param — calling fetch_allowed_type_ids")  # ← ADD THIS
         typeIDs = await fetch_allowed_type_ids(state)
-        log.info("typeIDs from Caspio lookup for state=%s: %s", state, typeIDs)
+        log.info("fetch_allowed_type_ids returned: %s", typeIDs)  # ← ADD THIS
 
     async with httpx.AsyncClient(timeout=15) as client:
         types_resp = await client.get(
