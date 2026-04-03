@@ -27,8 +27,8 @@ ACUITY_USER_ID        = os.getenv("ACUITY_USER_ID")
 ACUITY_API_KEY        = os.getenv("ACUITY_API_KEY")
 ACUITY_WEBHOOK_SECRET = os.getenv("ACUITY_WEBHOOK_SECRET")
 
-CASPIO_BASE_URL       = os.getenv("CASPIO_BASE_URL")        # token endpoint base
-CASPIO_API_BASE_URL   = os.getenv("CASPIO_API_BASE_URL")    # records endpoint base
+CASPIO_BASE_URL       = os.getenv("CASPIO_BASE_URL")
+CASPIO_API_BASE_URL   = os.getenv("CASPIO_API_BASE_URL")
 CASPIO_CLIENT_ID      = os.getenv("CASPIO_CLIENT_ID")
 CASPIO_CLIENT_SECRET  = os.getenv("CASPIO_CLIENT_SECRET")
 CASPIO_TABLE          = os.getenv("CASPIO_APPOINTMENTS_TABLE")
@@ -49,7 +49,7 @@ log = logging.getLogger("acuity-proxy")
 app = FastAPI(
     title="Acuity ↔ Caspio Proxy",
     description="Covers all Acuity availability, appointments, and Caspio sync",
-    version="3.0.0"
+    version="4.0.0"
 )
 
 app.add_middleware(
@@ -81,7 +81,7 @@ class CheckTimesRequest(BaseModel):
     appointmentTypeID: int
     calendarID: Optional[int] = None
     datetime: str
-    timezone: Optional[str]   = "America/New_York"
+    timezone: Optional[str] = "America/New_York"
 
 
 # --------------------------------------------------
@@ -140,7 +140,6 @@ async def caspio_headers():
 # --------------------------------------------------
 
 def verify_acuity_signature(raw_body: bytes, signature: Optional[str]) -> bool:
-    # Disabled — Acuity signing key not available in UI
     return True
 
 
@@ -154,7 +153,7 @@ def extract_referral_id(appointment: dict) -> Optional[str]:
             if field.get("fieldID") == 18222169:
                 val = str(field.get("value", "")).strip()
                 if val and len(val) < 100 and "\n" not in val:
-                    log.info("referral_id extracted: %s", val)  # ← add this
+                    log.info("referral_id extracted: %s", val)
                     return val
 
     forms_text = appointment.get("formsText", "")
@@ -163,10 +162,27 @@ def extract_referral_id(appointment: dict) -> Optional[str]:
         if match:
             val = match.group(1).strip()
             if val and len(val) < 100:
-                log.info("referral_id extracted via formsText: %s", val)  # ← add this
+                log.info("referral_id extracted via formsText: %s", val)
                 return val
 
     log.warning("referral_id not found in appointment %s", appointment.get("id"))
+    return None
+
+
+# --------------------------------------------------
+# CLINIC ID HELPER
+# --------------------------------------------------
+
+def extract_clinic_id(appointment: dict) -> Optional[str]:
+    for form in appointment.get("forms", []):
+        for field in form.get("values", []):
+            if (
+                field.get("fieldID") == 18236523
+                or field.get("name", "").lower() == "clinic_id"
+            ):
+                val = str(field.get("value", "")).strip()
+                if val and len(val) < 100 and "\n" not in val:
+                    return val
     return None
 
 
@@ -190,35 +206,34 @@ async def caspio_upsert_appointment(appointment: dict):
         return
 
     record = {
-    "appointment_id":                  str(apt_id),          # ★ Text field — use str not int
-    "patient_first_name":              appointment.get("firstName", ""),
-    "patient_second_name":             appointment.get("lastName", ""),
-    "patient_email":                   appointment.get("email", ""),
-    "phone_number":                    appointment.get("phone", ""),
-    "date_of_appointment":             appointment.get("date", ""),
-    "time_of_appointment":             appointment.get("datetime", ""),
-    "ending_time_of_appointment":      appointment.get("endTime", ""),
-    "calender_name":                   appointment.get("calendar", ""),
-    "calendar_id":                     str(appointment.get("calendarID", "")),
-    "appointment_type":                appointment.get("type", ""),
-    "appointment_type_id":             str(appointment.get("appointmentTypeID", "")),
-    "duration_of_appointment_minutes": str(appointment.get("duration", "")),
-    "canceled":                        str(appointment.get("canceled", False)),
-    "status":                          "Canceled" if appointment.get("canceled") else "Scheduled",
-    "notes":                           appointment.get("notes", ""),
-    "referral_id":                     extract_referral_id(appointment),
-    "clinic_id":                       extract_clinic_id(appointment),
-    "calender_link":                   appointment.get("confirmationPage", ""),
-    "confirmation_page_payment_link":  appointment.get("confirmationPagePaymentLink", ""),
-    "link_to_clients_confirm":         appointment.get("confirmationPage", ""),
-    "amount_paid":                     float(appointment.get("amountPaid", 0)),
-    "has_been_paid":                   appointment.get("paid", "no"),
-    "price_of_appointment":            float(appointment.get("price", 0)),
-    "price_sold":                      str(appointment.get("priceSold", "")),
-    "client_time_zone":                appointment.get("timezone", ""),
-    "calendar_timezone":               appointment.get("calendarTimezone", ""),
-    # ★ REMOVED: added_on, updated_on — both Timestamp, auto-managed by Caspio
-}
+        "appointment_id":                  str(apt_id),
+        "patient_first_name":              appointment.get("firstName", ""),
+        "patient_second_name":             appointment.get("lastName", ""),
+        "patient_email":                   appointment.get("email", ""),
+        "phone_number":                    appointment.get("phone", ""),
+        "date_of_appointment":             appointment.get("date", ""),
+        "time_of_appointment":             appointment.get("datetime", ""),
+        "ending_time_of_appointment":      appointment.get("endTime", ""),
+        "calender_name":                   appointment.get("calendar", ""),
+        "calendar_id":                     str(appointment.get("calendarID", "")),
+        "appointment_type":                appointment.get("type", ""),
+        "appointment_type_id":             str(appointment.get("appointmentTypeID", "")),
+        "duration_of_appointment_minutes": str(appointment.get("duration", "")),
+        "canceled":                        str(appointment.get("canceled", False)),
+        "status":                          "Canceled" if appointment.get("canceled") else "Scheduled",
+        "notes":                           appointment.get("notes", ""),
+        "referral_id":                     extract_referral_id(appointment),
+        "clinic_id":                       extract_clinic_id(appointment),
+        "calender_link":                   appointment.get("confirmationPage", ""),
+        "confirmation_page_payment_link":  appointment.get("confirmationPagePaymentLink", ""),
+        "link_to_clients_confirm":         appointment.get("confirmationPage", ""),
+        "amount_paid":                     float(appointment.get("amountPaid", 0)),
+        "has_been_paid":                   appointment.get("paid", "no"),
+        "price_of_appointment":            float(appointment.get("price", 0)),
+        "price_sold":                      str(appointment.get("priceSold", "")),
+        "client_time_zone":                appointment.get("timezone", ""),
+        "calendar_timezone":               appointment.get("calendarTimezone", ""),
+    }
 
     async with httpx.AsyncClient(timeout=15) as client:
         try:
@@ -260,10 +275,7 @@ async def caspio_mark_canceled(apt_id: int):
             f"{CASPIO_API_BASE_URL}/v2/tables/{CASPIO_TABLE}/records",
             headers=headers,
             params={"q.where": f"appointment_id='{apt_id}'"},
-            json={
-                "status":     "Canceled",
-                "updated_on": datetime.utcnow().isoformat()
-            }
+            json={"status": "Canceled"}
         )
     log.info("Caspio marked appointment ID %s as canceled", apt_id)
 
@@ -272,13 +284,9 @@ async def caspio_mark_canceled(apt_id: int):
 # ROUTES
 # ==================================================
 
-# --------------------------------------------------
-# HEALTH
-# --------------------------------------------------
-
 @app.get("/", tags=["Health"])
 async def root():
-    return {"service": "acuity-caspio-proxy", "status": "running", "version": "3.0.0"}
+    return {"service": "acuity-caspio-proxy", "status": "running", "version": "4.0.0"}
 
 
 @app.get("/health", tags=["Health"])
@@ -291,10 +299,7 @@ async def health():
 # --------------------------------------------------
 
 @app.get("/appointment-types", tags=["Configuration"])
-async def get_appointment_types(
-    calendarID: Optional[int] = Query(None)
-):
-    """Raw passthrough — returns all Acuity appointment types unfiltered."""
+async def get_appointment_types(calendarID: Optional[int] = Query(None)):
     params = {}
     if calendarID:
         params["calendarID"] = calendarID
@@ -329,7 +334,6 @@ async def get_appointment_addons():
 
 @app.get("/forms", tags=["Configuration"])
 async def get_forms():
-    """Get all Acuity form fields and their IDs."""
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.get(f"{ACUITY_BASE}/forms", headers=acuity_headers())
     if resp.status_code != 200:
@@ -481,10 +485,6 @@ async def get_appointments(
 
 @app.post("/appointments", tags=["Appointments"], status_code=201)
 async def create_appointment(body: dict, background_tasks: BackgroundTasks):
-    """
-    Book a new appointment. Pass referral_id via fields array:
-    { ..., "fields": [{ "id": 18222169, "value": "ZDHMRJPJ" }] }
-    """
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(
             f"{ACUITY_BASE}/appointments",
@@ -534,7 +534,6 @@ async def reschedule_appointment(
     body:             dict,
     background_tasks: BackgroundTasks,
 ):
-    """Body: { "datetime": "2025-03-20T11:00:00-0500" }"""
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.put(
             f"{ACUITY_BASE}/appointments/{appointment_id}/reschedule",
@@ -570,25 +569,12 @@ async def acuity_webhook(
     background_tasks:   BackgroundTasks,
     x_acuity_signature: Optional[str] = Header(None)
 ):
-    """
-    Register this URL in Acuity → Integrations → Webhooks.
-    Acuity sends form-encoded POST — handled correctly here.
-
-    Events:
-      scheduling.scheduled   → INSERT into Caspio
-      scheduling.rescheduled → UPDATE in Caspio
-      scheduling.changed     → UPDATE in Caspio
-      scheduling.canceled    → Mark Canceled in Caspio
-      order.completed        → UPDATE in Caspio
-    """
     raw_body = await request.body()
     log.info("Webhook raw body: %s", raw_body[:300])
 
     if not verify_acuity_signature(raw_body, x_acuity_signature):
         raise HTTPException(401, "Invalid webhook signature")
 
-    # Acuity sends application/x-www-form-urlencoded — NOT JSON
-    # Accept both form-encoded (real Acuity) and JSON (manual curl testing)
     try:
         content_type = request.headers.get("content-type", "")
         if "application/json" in content_type:
@@ -603,10 +589,10 @@ async def acuity_webhook(
     except Exception as e:
         log.error("Failed to parse webhook body: %s", e)
         raise HTTPException(400, "Invalid payload")
+
     if not apt_id:
         return {"status": "ignored", "reason": "no appointment id"}
 
-    # Deduplicate
     webhook_id = f"{action}_{apt_id}"
     if webhook_id in recent_webhooks:
         return {"status": "duplicate ignored"}
@@ -622,21 +608,16 @@ async def acuity_webhook(
             log.error("Cancel failed: %s", e)
 
     elif action in (
-    "scheduling.scheduled",
-    "scheduling.rescheduled",
-    "scheduling.changed",
-    "order.completed",
-    # ★ Acuity sometimes sends without "scheduling." prefix
-    "scheduled",
-    "rescheduled",
-    "changed",
-    "canceled",
-
+        "scheduling.scheduled",
+        "scheduling.rescheduled",
+        "scheduling.changed",
+        "order.completed",
+        "scheduled",
+        "rescheduled",
+        "changed",
     ):
         try:
-            # ★ Wait 3 seconds — gives Acuity time to save form data
             await asyncio.sleep(3)
-
             async with httpx.AsyncClient(timeout=10) as client:
                 resp = await client.get(
                     f"{ACUITY_BASE}/appointments/{apt_id}",
@@ -655,10 +636,6 @@ async def acuity_webhook(
 
     return {"status": "processed", "action": action, "id": apt_id}
 
-
-# ==================================================
-# FILTERING — 50-min Psych Eval
-# ==================================================
 
 # ==================================================
 # FILTERING — 50-min Psych Eval
@@ -695,42 +672,63 @@ for s in STATE_KEYWORDS:
     STATE_NORMALIZER[s.lower()] = s
 
 # --------------------------------------------------
-# MASTER TYPE MAP
-# Priority 1 — checked before any keyword logic
-# str  → type is locked to that one state only
-# None → type belongs to PSYPACT generic pool
-# Types NOT in this map fall through to keyword matching (dynamic fallback)
+# MASTER HARDCODED MAP
+# This is the single source of truth.
+# str  → locked to that state only
+# None → PSYPACT generic pool (all PSYPACT states)
+# New therapist added? Add one line here.
 # --------------------------------------------------
-TYPE_STATE_MAP: dict = {
-    # California (non-PSYPACT)
-    67331536: "California",   # Dr. Tamara Rumburg
-    52823893: "California",   # Dr. Megan Cannon   ← bug fix
-    55211731: "California",   # Dr. Emily Hu
-    37231009: "California",   # Dr. Charlynn Ruan  (CA-specific type)
-    44643246: "California",   # Dr. Beverly Ibeh
+PSYPACT_IDS = "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634"
 
-    # Iowa (non-PSYPACT)
-    72914876: "Iowa",         # Dr. Jennifer Alpert
-    55554634: "Iowa",         # Dr. Charlynn Ruan
-
-    # PSYPACT pool — state-labelled types
-    73689906: None,           # Dr. Jennifer Alpert  (Indiana label)
-    73062970: None,           # Dr. Jennifer Alpert  (Pennsylvania label)
-    74542331: None,           # Dr. Jennifer Alpert  (DC label)
-    74804055: None,           # Dr. Jennifer Alpert  (Eastern Time)
-    55554566: None,           # Dr. Charlynn Ruan    (Texas label)
-
-    # PSYPACT pool — generic types
-    75932446: None,           # Dr. Courtney Cook, PhD
-    81046199: None,           # Dr. Bethany Young
-    81046572: None,           # Dr. Danielle Powers
-    84889378: None,           # Dr. Yessenia Castillo
-    88803811: None,           # Dr. Jacqueline Herrera
-    74926724: None,           # Dr. Jennifer Alpert  (generic)
-    58693634: None,           # Dr. Charlynn Ruan    (generic)
+STATE_TYPE_IDS: dict = {
+    # NON-PSYPACT — state-locked
+    "California":           "67331536,52823893,55211731,37231009,44643246",
+    "Iowa":                 "72914876,55554634",
+    "New York":             "",
+    "Hawaii":               "",
+    "Alaska":               "",
+    "Oregon":               "",
+    "New Mexico":           "",
+    "Louisiana":            "",
+    "Massachusetts":        "",
+    # PSYPACT pool
+    "Indiana":              PSYPACT_IDS,
+    "Pennsylvania":         PSYPACT_IDS,
+    "Texas":                PSYPACT_IDS,
+    "District of Columbia": PSYPACT_IDS,
+    "Virginia":             PSYPACT_IDS,
+    "Illinois":             PSYPACT_IDS,
+    "Arizona":              PSYPACT_IDS,
+    "Colorado":             PSYPACT_IDS,
+    "Connecticut":          PSYPACT_IDS,
+    "Delaware":             PSYPACT_IDS,
+    "Georgia":              PSYPACT_IDS,
+    "Idaho":                PSYPACT_IDS,
+    "Kansas":               PSYPACT_IDS,
+    "Kentucky":             PSYPACT_IDS,
+    "Maine":                PSYPACT_IDS,
+    "Maryland":             PSYPACT_IDS,
+    "Michigan":             PSYPACT_IDS,
+    "Minnesota":            PSYPACT_IDS,
+    "Missouri":             PSYPACT_IDS,
+    "Nebraska":             PSYPACT_IDS,
+    "Nevada":               PSYPACT_IDS,
+    "New Hampshire":        PSYPACT_IDS,
+    "New Jersey":           PSYPACT_IDS,
+    "North Carolina":       PSYPACT_IDS,
+    "North Dakota":         PSYPACT_IDS,
+    "Ohio":                 PSYPACT_IDS,
+    "Rhode Island":         PSYPACT_IDS,
+    "South Carolina":       PSYPACT_IDS,
+    "Tennessee":            PSYPACT_IDS,
+    "Utah":                 PSYPACT_IDS,
+    "Vermont":              PSYPACT_IDS,
+    "West Virginia":        PSYPACT_IDS,
+    "Wisconsin":            PSYPACT_IDS,
+    "Wyoming":              PSYPACT_IDS,
 }
 
-# Test type IDs — always hidden from patients
+# Test type IDs — always hidden
 TEST_TYPE_IDS: set = {
     90824033, 90822425, 90822613, 90822881,
     90826017, 90827405,
@@ -762,55 +760,43 @@ def matches_state(apt_type: dict, state: str) -> bool:
 
 
 def _route_type(apt_type: dict) -> str:
-    """
-    Returns routing label for a type:
-      'non_psypact:California'  → locked to that state only
-      'psypact'                 → appears in all PSYPACT states
-    Priority 1: TYPE_STATE_MAP (hardcoded, immune to Acuity edits)
-    Priority 2: keyword matching (dynamic fallback for new types)
-    Naming convention for new types to be caught dynamically:
-      Non-PSYPACT → name AND category must contain the state name
-                    e.g. "Thrive California: 50 Minute... with Dr. X"
-                         category: "THRIVE CALIFORNIA: Psychological Evaluation"
-      PSYPACT     → name: "Thrive: 50 Minute... with Dr. X"
-                    category: "THRIVE: Psychological Evaluation"
-    """
     tid = apt_type["id"]
-    if tid in TYPE_STATE_MAP:
-        mapped = TYPE_STATE_MAP[tid]
-        return f"non_psypact:{mapped}" if mapped else "psypact"
-
-    # Dynamic fallback
+    # Dynamic fallback only — used by debug endpoint
     for s in NON_PSYPACT_STATES:
         if matches_state(apt_type, s):
             return f"non_psypact:{s}"
     return "psypact"
 
 
-def get_matched_types(all_types: list, state: str) -> list:
-    eligible = [
+def get_allowed_types(all_types: list, state: str) -> list:
+    """
+    Filter Acuity types using STATE_TYPE_IDS hardcoded map.
+    This is the ONLY filtering function used by availability routes.
+    """
+    type_ids_str = STATE_TYPE_IDS.get(state, None)
+
+    if type_ids_str is None:
+        # State not in map at all — outside US — return all 50-min types
+        log.info("state=%s outside US — returning all eligible types", state)
+        return [
+            t for t in all_types
+            if is_50min_psych_eval(t) and t["id"] not in TEST_TYPE_IDS
+        ]
+
+    if type_ids_str == "":
+        # State in map but no therapists assigned yet
+        log.info("state=%s in map but no typeIDs assigned", state)
+        return []
+
+    allowed = set(int(x.strip()) for x in type_ids_str.split(",") if x.strip())
+    matched = [
         t for t in all_types
-        if is_50min_psych_eval(t)
+        if t["id"] in allowed
+        and is_50min_psych_eval(t)
         and t["id"] not in TEST_TYPE_IDS
     ]
-
-    all_known = set(STATE_KEYWORDS.keys()) | NON_PSYPACT_STATES
-
-    if state in NON_PSYPACT_STATES:
-        return [t for t in eligible if _route_type(t) == f"non_psypact:{state}"]
-    elif state in all_known:
-        return [t for t in eligible if _route_type(t) == "psypact"]
-    return eligible  # outside US — all types
-
-
-def pick_best_type(types_for_calendar: list, state: str) -> dict:
-    for t in types_for_calendar:
-        if matches_state(t, state):
-            return t
-    for t in types_for_calendar:
-        if t.get("category", "").upper().strip() == "THRIVE: PSYCHOLOGICAL EVALUATION":
-            return t
-    return types_for_calendar[0]
+    log.info("VERSION=4.0.0 state=%s allowed=%s matched=%s", state, len(allowed), len(matched))
+    return matched
 
 
 def extract_doctor_name(type_name: str) -> str:
@@ -819,100 +805,9 @@ def extract_doctor_name(type_name: str) -> str:
     return type_name
 
 
-def extract_clinic_id(appointment: dict) -> Optional[str]:
-    for form in appointment.get("forms", []):
-        for field in form.get("values", []):
-            if (
-                field.get("fieldID") == 18236523
-                or field.get("name", "").lower() == "clinic_id"
-            ):
-                val = str(field.get("value", "")).strip()
-                if val and len(val) < 100 and "\n" not in val:
-                    return val
-    return None
-
-def extract_clinic_id(appointment: dict) -> Optional[str]:
-    """Extract clinic_id from Acuity form field."""
-    for form in appointment.get("forms", []):
-        for field in form.get("values", []):
-            if (
-                field.get("fieldID") == 18236523  # replace with actual ID
-                or field.get("name", "").lower() == "clinic_id"
-            ):
-                val = str(field.get("value", "")).strip()
-                if val and len(val) < 100 and "\n" not in val:
-                    return val
-    return None
-
-async def fetch_allowed_type_ids(state: str) -> Optional[str]:
-    try:
-        headers = await caspio_headers()
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                f"{CASPIO_API_BASE_URL}/v2/tables/State_TypeID_Map/records",
-                headers=headers,
-                params={"q.where": f"state_name='{state}'", "q.limit": 1}
-            )
-        log.info("Caspio typeID lookup status=%s body=%s", resp.status_code, resp.text[:300])
-        result = resp.json().get("Result", [])
-        if result:
-            return result[0].get("allowed_type_ids", "")
-        else:
-            log.warning("Caspio typeID lookup returned empty result for state=%s", state)
-    except Exception as e:
-        log.error("Caspio typeID lookup failed: %s", e)
-    return None
-
-
-# Hardcoded — source of truth for which typeIDs are allowed per state
-# To add a new therapist: add their typeID to the correct state list
-STATE_TYPE_IDS: dict = {
-    "California":           "67331536,52823893,55211731,37231009,44643246",
-    "Iowa":                 "72914876,55554634",
-    "New York":             "",
-    "Hawaii":               "",
-    "Alaska":               "",
-    "Oregon":               "",
-    "New Mexico":           "",
-    "Louisiana":            "",
-    "Massachusetts":        "",
-    # All PSYPACT states get the same pool
-    "Indiana":              "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
-    "Pennsylvania":         "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
-    "Texas":                "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
-    "District of Columbia": "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
-    "Virginia":             "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
-    "Illinois":             "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
-    "Arizona":              "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
-    "Colorado":             "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
-    "Connecticut":          "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
-    "Delaware":             "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
-    "Georgia":              "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
-    "Idaho":                "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
-    "Kansas":               "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
-    "Kentucky":             "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
-    "Maine":                "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
-    "Maryland":             "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
-    "Michigan":             "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
-    "Minnesota":            "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
-    "Missouri":             "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
-    "Nebraska":             "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
-    "Nevada":               "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
-    "New Hampshire":        "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
-    "New Jersey":           "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
-    "North Carolina":       "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
-    "North Dakota":         "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
-    "Ohio":                 "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
-    "Rhode Island":         "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
-    "South Carolina":       "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
-    "Tennessee":            "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
-    "Utah":                 "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
-    "Vermont":              "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
-    "West Virginia":        "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
-    "Wisconsin":            "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
-    "Wyoming":              "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
-}
-
+# ==================================================
+# STATE-BASED AVAILABILITY ROUTES
+# ==================================================
 
 @app.get("/availability/by-state", tags=["Availability"])
 async def availability_by_state(
@@ -921,6 +816,7 @@ async def availability_by_state(
     timezone: str = Query("America/New_York"),
 ):
     state = STATE_NORMALIZER.get(state.strip().lower(), state.strip())
+    log.info("availability/by-state called — state=%s date=%s", state, date)
 
     async with httpx.AsyncClient(timeout=15) as client:
         types_resp = await client.get(
@@ -930,24 +826,7 @@ async def availability_by_state(
     if types_resp.status_code != 200:
         raise HTTPException(500, "Could not fetch appointment types")
 
-    all_types = types_resp.json()
-
-    # Get allowed typeIDs for this state directly from hardcoded map
-    type_ids_str = STATE_TYPE_IDS.get(state, "")
-
-    if type_ids_str:
-        allowed = set(int(x.strip()) for x in type_ids_str.split(",") if x.strip())
-        matched_types = [
-            t for t in all_types
-            if t["id"] in allowed
-            and is_50min_psych_eval(t)
-            and t["id"] not in TEST_TYPE_IDS
-        ]
-        log.info("state=%s hardcoded filter active — allowed=%s matched=%s", state, len(allowed), len(matched_types))
-    else:
-        # State not in map at all — outside US, show everything
-        matched_types = get_matched_types(all_types, state)
-        log.info("state=%s not in map — keyword fallback matched=%s", state, len(matched_types))
+    matched_types = get_allowed_types(types_resp.json(), state)
 
     if not matched_types:
         return {
@@ -957,7 +836,6 @@ async def availability_by_state(
             "slots":   []
         }
 
-    # ── everything below unchanged ────────────────────────────────────
     cal_to_types_list = defaultdict(list)
     for apt_type in matched_types:
         for cal_id in apt_type.get("calendarIDs", []):
@@ -1063,12 +941,11 @@ async def availability_dates_by_state(
     month:    Optional[str] = Query(None, description="YYYY-MM. Defaults to current month"),
     timezone: str           = Query("America/New_York"),
 ):
-    """
-    Get available DATES for 50-min Psych Evals. Same routing as /availability/by-state.
-    Caspio calls this first to show date chips to the patient.
-    """
     if not month:
         month = datetime.now().strftime("%Y-%m")
+
+    state = STATE_NORMALIZER.get(state.strip().lower(), state.strip())
+    log.info("availability/dates-by-state called — state=%s month=%s", state, month)
 
     async with httpx.AsyncClient(timeout=15) as client:
         types_resp = await client.get(
@@ -1078,13 +955,12 @@ async def availability_dates_by_state(
     if types_resp.status_code != 200:
         raise HTTPException(500, "Could not fetch appointment types")
 
-    matched_types = get_matched_types(types_resp.json(), state)
+    # ★ FIXED — uses get_allowed_types (hardcoded map) not get_matched_types
+    matched_types = get_allowed_types(types_resp.json(), state)
 
     if not matched_types:
         return {"state": state, "month": month, "dates": []}
 
-    # Build calendarID → LIST of all typeIDs
-    # Query ALL types per calendar — same reason as by-state above
     cal_to_typeids = defaultdict(list)
     for apt_type in matched_types:
         for cal_id in apt_type.get("calendarIDs", []):
@@ -1093,7 +969,6 @@ async def availability_dates_by_state(
     if not cal_to_typeids:
         return {"state": state, "month": month, "dates": []}
 
-    # Fetch dates for ALL types per calendar in parallel
     async with httpx.AsyncClient(timeout=20) as client:
         tasks = []
         for cal_id, type_ids in cal_to_typeids.items():
@@ -1128,14 +1003,12 @@ async def availability_dates_by_state(
     }
 
 
-
 # ==================================================
 # ADMIN / DEBUG
 # ==================================================
 
 @app.get("/admin/test-caspio", tags=["Admin"])
 async def test_caspio():
-    """Test Caspio token and table connectivity."""
     try:
         headers = await caspio_headers()
         async with httpx.AsyncClient(timeout=10) as client:
@@ -1156,7 +1029,6 @@ async def test_caspio():
 
 @app.get("/admin/debug-types", tags=["Admin"])
 async def debug_types(state: Optional[str] = Query(None)):
-    """Show which types pass the 50-min psych eval filter and why others fail."""
     async with httpx.AsyncClient(timeout=15) as client:
         types_resp = await client.get(
             f"{ACUITY_BASE}/appointment-types",
@@ -1181,10 +1053,10 @@ async def debug_types(state: Optional[str] = Query(None)):
             reasons.append("no calendarIDs assigned")
 
         entry = {
-            "id":       t["id"],
-            "name":     t.get("name", ""),
-            "category": t.get("category", ""),
-            "duration": duration,
+            "id":        t["id"],
+            "name":      t.get("name", ""),
+            "category":  t.get("category", ""),
+            "duration":  duration,
             "calendars": t.get("calendarIDs", []),
         }
         if reasons:
@@ -1192,13 +1064,15 @@ async def debug_types(state: Optional[str] = Query(None)):
             failed.append(entry)
         else:
             if state:
-                entry["matches_state"]   = matches_state(t, state)
                 entry["route"]           = _route_type(t)
                 entry["is_non_psypact"]  = _route_type(t).startswith("non_psypact")
                 entry["in_psypact_pool"] = _route_type(t) == "psypact"
+                entry["in_state_map"]    = t["id"] in [
+                    int(x) for x in STATE_TYPE_IDS.get(state, "").split(",") if x.strip()
+                ]
             passed.append(entry)
 
-    matched = get_matched_types(all_types, state) if state else []
+    matched = get_allowed_types(all_types, state) if state else []
 
     return {
         "total_types":        len(all_types),
@@ -1212,7 +1086,6 @@ async def debug_types(state: Optional[str] = Query(None)):
 
 @app.get("/states/psypact-check", tags=["Configuration"])
 async def psypact_check(state: str = Query(...)):
-    """Check routing pool for a given state."""
     all_known = set(STATE_KEYWORDS.keys()) | NON_PSYPACT_STATES
     if state in NON_PSYPACT_STATES:
         pool = "state-specific"
@@ -1220,11 +1093,12 @@ async def psypact_check(state: str = Query(...)):
         pool = "psypact"
     else:
         pool = "all (outside US)"
-    return {"state": state, "pool": pool}
+    type_ids = STATE_TYPE_IDS.get(state, "not in map")
+    return {"state": state, "pool": pool, "assigned_type_ids": type_ids}
+
 
 @app.get("/admin/debug-appointment/{appointment_id}", tags=["Admin"])
 async def debug_appointment(appointment_id: int):
-    """Show raw forms data from Acuity for debugging referral_id extraction."""
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.get(
             f"{ACUITY_BASE}/appointments/{appointment_id}",
@@ -1232,7 +1106,6 @@ async def debug_appointment(appointment_id: int):
         )
     if resp.status_code != 200:
         raise HTTPException(resp.status_code, resp.text)
-    
     data = resp.json()
     return {
         "id":        data.get("id"),
