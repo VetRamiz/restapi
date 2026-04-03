@@ -1,7 +1,5 @@
 import os
 import base64
-importimport os
-import base64
 import hmac
 import hashlib
 import logging
@@ -1194,7 +1192,7 @@ async def debug_appointment(appointment_id: int):
         "forms":     data.get("forms", []),
         "formsText": data.get("formsText", ""),
         "notes":     data.get("notes", ""),
-    } hmac
+    }
 import hashlib
 import logging
 import random
