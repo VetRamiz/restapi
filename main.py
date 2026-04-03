@@ -49,7 +49,7 @@ log = logging.getLogger("acuity-proxy")
 app = FastAPI(
     title="Acuity ↔ Caspio Proxy",
     description="Covers all Acuity availability, appointments, and Caspio sync",
-    version="5.0.0"
+    version="5.1.0"
 )
 
 app.add_middleware(
@@ -828,6 +828,39 @@ NON_PSYPACT_STATES: set[str] = {
 # State name normaliser — lower-case key → canonical name
 STATE_NORMALIZER: dict[str, str] = {s.lower(): s for s in STATE_TYPE_IDS}
 
+# ── CALENDAR OVERRIDES ────────────────────────────────────────────────────────
+# Some Acuity appointment types return calendarIDs=[] from the API even though
+# the therapist has real availability. This happens when Acuity's internal state
+# gets out of sync (e.g. calendar re-assignment, account changes).
+# Override map: { type_id (int) → [calendar_id, ...] }
+# Source: confirmed from direct Acuity booking URLs.
+CALENDAR_OVERRIDES: dict[int, list[int]] = {
+    44643246: [7083363],  # Dr. Beverly Ibeh — CA (from booking URL /calendar/7083363)
+    60953633: [],         # Dr. Emily Hu — Iowa (intentionally no calendar — keep excluded)
+    60953734: [],         # Dr. Emily Hu — Texas (intentionally no calendar — keep excluded)
+    75935569: [],         # Dr. Chemarum — generic (no calendar — keep excluded)
+    49484128: [],         # Dr. Toni Leo — generic (no calendar — keep excluded)
+}
+
+
+def resolve_calendar_ids(apt_type: dict) -> list:
+    """
+    Return the effective calendarIDs for a type, applying CALENDAR_OVERRIDES
+    when Acuity returns an empty list.  An override of [] means 'intentionally
+    excluded even if Acuity later assigns a calendar'.
+    """
+    tid = apt_type.get("id")
+    if tid in CALENDAR_OVERRIDES:
+        overridden = CALENDAR_OVERRIDES[tid]
+        if overridden != apt_type.get("calendarIDs", []):
+            log.info(
+                "CALENDAR_OVERRIDE applied for type %s: %s → %s",
+                tid, apt_type.get("calendarIDs"), overridden
+            )
+        return overridden
+    return apt_type.get("calendarIDs", [])
+
+
 # ── BASE FILTER ────────────────────────────────────────────────────────────────
 
 def is_50min_psych_eval(apt_type: dict) -> bool:
@@ -840,7 +873,8 @@ def is_50min_psych_eval(apt_type: dict) -> bool:
             return False
     except (TypeError, ValueError):
         return False
-    if not apt_type.get("calendarIDs"):
+    # Use resolved calendar IDs (respects CALENDAR_OVERRIDES)
+    if not resolve_calendar_ids(apt_type):
         return False
     if apt_type.get("id") in TEST_TYPE_IDS:
         return False
@@ -877,7 +911,7 @@ def get_allowed_types(all_types: list, state: str) -> list:
         if t["id"] in allowed_ids and is_50min_psych_eval(t)
     ]
     log.info(
-        "VERSION=5.0.0 state=%s allowed_ids=%d matched=%d",
+        "VERSION=5.1.0 state=%s allowed_ids=%d matched=%d",
         state, len(allowed_ids), len(matched)
     )
     return matched
@@ -922,7 +956,7 @@ async def availability_by_state(
 
     cal_to_types_list: dict = defaultdict(list)
     for apt_type in matched_types:
-        for cal_id in apt_type.get("calendarIDs", []):
+        for cal_id in resolve_calendar_ids(apt_type):
             cal_to_types_list[cal_id].append({
                 "appointmentTypeID": apt_type["id"],
                 "schedulingUrl":     apt_type.get("schedulingUrl", ""),
@@ -1045,7 +1079,7 @@ async def availability_dates_by_state(
 
     cal_to_typeids: dict = defaultdict(list)
     for apt_type in matched_types:
-        for cal_id in apt_type.get("calendarIDs", []):
+        for cal_id in resolve_calendar_ids(apt_type):
             cal_to_typeids[cal_id].append(apt_type["id"])
 
     if not cal_to_typeids:
