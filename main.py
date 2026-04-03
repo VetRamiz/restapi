@@ -660,28 +660,20 @@ async def acuity_webhook(
 # FILTERING — 50-min Psych Eval
 # ==================================================
 
+# ==================================================
+# FILTERING — 50-min Psych Eval
+# ==================================================
+
 PSYCH_EVAL_CATEGORY_KEYWORD = "PSYCHOLOGICAL EVALUATION"
 ALLOWED_DURATION            = 50
 
-
-
-# States shown with THEIR OWN therapists only (not pooled)
 NON_PSYPACT_STATES = {
-    "New York",
-    "Hawaii",
-    "Iowa",
-    "Alaska",
-    "Oregon",
-    "New Mexico",
-    "Louisiana",
-    "California",
-    "Massachusetts",
+    "New York", "Hawaii", "Iowa", "Alaska", "Oregon",
+    "New Mexico", "Louisiana", "California", "Massachusetts",
 }
 
-# Keywords per state — used for both non-PSYPACT filtering
-# and for excluding non-PSYPACT types from the PSYPACT pool
 STATE_KEYWORDS = {
-    "California":           ["CALIFORNIA", "SANTA MONICA","THRIVE CALIFORNIA"],
+    "California":           ["CALIFORNIA", "SANTA MONICA", "THRIVE CALIFORNIA"],
     "New York":             ["NEW YORK", "THRIVE NY"],
     "Hawaii":               ["HAWAII"],
     "Alaska":               ["ALASKA"],
@@ -695,62 +687,59 @@ STATE_KEYWORDS = {
     "Texas":                ["TEXAS", "THRIVE TX"],
     "District of Columbia": ["THRIVE DC"],
 }
-# Add this near your STATE_KEYWORDS block
-CALENDAR_STATE_MAP: dict = {
-    # California-only calendars (non-PSYPACT)
-    7409433:  "California",   # Dr. Tamara Rumburg
-    8894649:  "California",   # Dr. Megan Cannon  ← THE FIX
-    3522898:  "California",   # Dr. Emily Hu (Santa Monica)
-    7083363:  "California",   # Dr. Beverly Ibeh
 
-    # PSYPACT generic (explicitly not state-restricted)
-    11762120: None,           # Dr. Courtney Cook
-    12453641: None,           # Dr. Bethany Young
-    12453652: None,           # Dr. Danielle Powers
-    12935263: None,           # Dr. Yessenia Castillo
-    13500779: None,           # Dr. Jacqueline Herrera
-    # NOTE: 1565153 (Charlynn Ruan) and 10171989 (Jennifer Alpert)
-    # intentionally NOT in map — they serve multiple states,
-    # keyword matching on type name handles them correctly.
-}
-
-# appointmentTypeID → the ONE state it must only appear in
-# These are types where Acuity category/name cannot be trusted
-STATE_LOCKED_TYPES: dict = {
-    52823893: "California",   # Dr. Megan Cannon — leaks into PSYPACT pool
-}
-def is_non_psypact_type(apt_type: dict) -> bool:
-    # Step 1 — calendar map wins over everything
-    for cal_id in apt_type.get("calendarIDs", []):
-        if cal_id in CALENDAR_STATE_MAP:
-            mapped = CALENDAR_STATE_MAP[cal_id]
-            return mapped is not None and mapped in NON_PSYPACT_STATES
-
-    # Step 2 — dynamic fallback for any new type not in the map
-    for state in NON_PSYPACT_STATES:
-        if matches_state(apt_type, state):
-            return True
-    return False
-# Create a mapping of lowercase states to their proper casing
 STATE_NORMALIZER = {}
-
 for s in NON_PSYPACT_STATES:
     STATE_NORMALIZER[s.lower()] = s
-
 for s in STATE_KEYWORDS:
     STATE_NORMALIZER[s.lower()] = s
 
+# --------------------------------------------------
+# MASTER TYPE MAP
+# Priority 1 — checked before any keyword logic
+# str  → type is locked to that one state only
+# None → type belongs to PSYPACT generic pool
+# Types NOT in this map fall through to keyword matching (dynamic fallback)
+# --------------------------------------------------
+TYPE_STATE_MAP: dict = {
+    # California (non-PSYPACT)
+    67331536: "California",   # Dr. Tamara Rumburg
+    52823893: "California",   # Dr. Megan Cannon   ← bug fix
+    55211731: "California",   # Dr. Emily Hu
+    37231009: "California",   # Dr. Charlynn Ruan  (CA-specific type)
+    44643246: "California",   # Dr. Beverly Ibeh
+
+    # Iowa (non-PSYPACT)
+    72914876: "Iowa",         # Dr. Jennifer Alpert
+    55554634: "Iowa",         # Dr. Charlynn Ruan
+
+    # PSYPACT pool — state-labelled types
+    73689906: None,           # Dr. Jennifer Alpert  (Indiana label)
+    73062970: None,           # Dr. Jennifer Alpert  (Pennsylvania label)
+    74542331: None,           # Dr. Jennifer Alpert  (DC label)
+    74804055: None,           # Dr. Jennifer Alpert  (Eastern Time)
+    55554566: None,           # Dr. Charlynn Ruan    (Texas label)
+
+    # PSYPACT pool — generic types
+    75932446: None,           # Dr. Courtney Cook, PhD
+    81046199: None,           # Dr. Bethany Young
+    81046572: None,           # Dr. Danielle Powers
+    84889378: None,           # Dr. Yessenia Castillo
+    88803811: None,           # Dr. Jacqueline Herrera
+    74926724: None,           # Dr. Jennifer Alpert  (generic)
+    58693634: None,           # Dr. Charlynn Ruan    (generic)
+}
+
+# Test type IDs — always hidden from patients
+TEST_TYPE_IDS: set = {
+    90824033, 90822425, 90822613, 90822881,
+    90826017, 90827405,
+}
+
 
 def is_50min_psych_eval(apt_type: dict) -> bool:
-    """
-    Core filter:
-    - Category must contain 'PSYCHOLOGICAL EVALUATION'
-    - Duration must be exactly 50 (handles string or int)
-    - Must have at least one calendarID assigned
-    """
     category = apt_type.get("category", "").upper()
     duration  = apt_type.get("duration")
-
     if PSYCH_EVAL_CATEGORY_KEYWORD not in category:
         return False
     try:
@@ -764,7 +753,6 @@ def is_50min_psych_eval(apt_type: dict) -> bool:
 
 
 def matches_state(apt_type: dict, state: str) -> bool:
-    """True if type's category or name contains any keyword for the given state."""
     cat  = apt_type.get("category", "").upper()
     name = apt_type.get("name", "").upper()
     for kw in STATE_KEYWORDS.get(state, [state.upper()]):
@@ -773,68 +761,75 @@ def matches_state(apt_type: dict, state: str) -> bool:
     return False
 
 
+def _route_type(apt_type: dict) -> str:
+    """
+    Returns routing label for a type:
+      'non_psypact:California'  → locked to that state only
+      'psypact'                 → appears in all PSYPACT states
+    Priority 1: TYPE_STATE_MAP (hardcoded, immune to Acuity edits)
+    Priority 2: keyword matching (dynamic fallback for new types)
+    Naming convention for new types to be caught dynamically:
+      Non-PSYPACT → name AND category must contain the state name
+                    e.g. "Thrive California: 50 Minute... with Dr. X"
+                         category: "THRIVE CALIFORNIA: Psychological Evaluation"
+      PSYPACT     → name: "Thrive: 50 Minute... with Dr. X"
+                    category: "THRIVE: Psychological Evaluation"
+    """
+    tid = apt_type["id"]
+    if tid in TYPE_STATE_MAP:
+        mapped = TYPE_STATE_MAP[tid]
+        return f"non_psypact:{mapped}" if mapped else "psypact"
+
+    # Dynamic fallback
+    for s in NON_PSYPACT_STATES:
+        if matches_state(apt_type, s):
+            return f"non_psypact:{s}"
+    return "psypact"
 
 
 def get_matched_types(all_types: list, state: str) -> list:
-    """
-    Three-way routing:
+    eligible = [
+        t for t in all_types
+        if is_50min_psych_eval(t)
+        and t["id"] not in TEST_TYPE_IDS
+    ]
 
-    1. NON-PSYPACT state (CA, NY, IA etc.)
-       → only types matching that specific state
+    all_known = set(STATE_KEYWORDS.keys()) | NON_PSYPACT_STATES
 
-    2. PSYPACT / other US state
-       → all types NOT belonging to a non-PSYPACT state
-       → includes: generic 'THRIVE: Psychological Evaluation' types
-       → includes: Indiana, DC, PA, TX specific types
-       → excludes: CA, NY, IA, OR etc.
-
-    3. Outside US (any unrecognized location)
-       → ALL 50-min psych eval types, no filter
-    """
-    # Hard lock — these type IDs only appear for their assigned state
-    def state_lock_passes(apt_type: dict) -> bool:
-        locked_to = STATE_LOCKED_TYPES.get(apt_type["id"])
-        if locked_to is None:
-            return True           # not locked, proceed normally
-        return locked_to == state # locked — only passes if state matches exactly
-    eligible = [t for t in all_types if is_50min_psych_eval(t)]
-
-    # Case 1 — non-PSYPACT state
     if state in NON_PSYPACT_STATES:
-        return [t for t in eligible if matches_state(t, state)]
+        return [t for t in eligible if _route_type(t) == f"non_psypact:{state}"]
+    elif state in all_known:
+        return [t for t in eligible if _route_type(t) == "psypact"]
+    return eligible  # outside US — all types
 
-    # Case 2 — known US state → PSYPACT pool
-    all_known_states = set(STATE_KEYWORDS.keys()) | NON_PSYPACT_STATES
-    if state in all_known_states:
-        return [t for t in eligible if not is_non_psypact_type(t)]
-
-    # Case 3 — outside US or unrecognized → all therapists
-    return eligible
 
 def pick_best_type(types_for_calendar: list, state: str) -> dict:
-    """
-    When multiple appointment types share the same calendarID,
-    pick the most state-relevant one:
-    1. Exact state match (e.g. THRIVE INDIANA for Indiana query)
-    2. Generic THRIVE: type (no state)
-    3. Any other PSYPACT type
-    """
-    # Priority 1 — exact state match
     for t in types_for_calendar:
         if matches_state(t, state):
             return t
-    # Priority 2 — generic THRIVE: type
     for t in types_for_calendar:
         if t.get("category", "").upper().strip() == "THRIVE: PSYCHOLOGICAL EVALUATION":
             return t
-    # Priority 3 — first available
     return types_for_calendar[0]
 
+
 def extract_doctor_name(type_name: str) -> str:
-    """'...with Dr. Tamara Rumburg' → 'Dr. Tamara Rumburg'"""
     if " with " in type_name:
         return type_name.split(" with ")[-1].strip()
     return type_name
+
+
+def extract_clinic_id(appointment: dict) -> Optional[str]:
+    for form in appointment.get("forms", []):
+        for field in form.get("values", []):
+            if (
+                field.get("fieldID") == 18236523
+                or field.get("name", "").lower() == "clinic_id"
+            ):
+                val = str(field.get("value", "")).strip()
+                if val and len(val) < 100 and "\n" not in val:
+                    return val
+    return None
 
 def extract_clinic_id(appointment: dict) -> Optional[str]:
     """Extract clinic_id from Acuity form field."""
