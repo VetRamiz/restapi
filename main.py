@@ -853,9 +853,12 @@ async def fetch_allowed_type_ids(state: str) -> Optional[str]:
                 headers=headers,
                 params={"q.where": f"state_name='{state}'", "q.limit": 1}
             )
+        log.info("Caspio typeID lookup status=%s body=%s", resp.status_code, resp.text[:300])
         result = resp.json().get("Result", [])
         if result:
             return result[0].get("allowed_type_ids", "")
+        else:
+            log.warning("Caspio typeID lookup returned empty result for state=%s", state)
     except Exception as e:
         log.error("Caspio typeID lookup failed: %s", e)
     return None
