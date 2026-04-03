@@ -844,7 +844,170 @@ def extract_clinic_id(appointment: dict) -> Optional[str]:
                     return val
     return None
 
+async def fetch_allowed_type_ids(state: str) -> Optional[str]:
+    try:
+        headers = await caspio_headers()
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get(
+                f"{CASPIO_API_BASE_URL}/v2/tables/State_TypeID_Map/records",
+                headers=headers,
+                params={"q.where": f"state_name='{state}'", "q.limit": 1}
+            )
+        result = resp.json().get("Result", [])
+        if result:
+            return result[0].get("allowed_type_ids", "")
+    except Exception as e:
+        log.error("Caspio typeID lookup failed: %s", e)
+    return None
 
+
+@app.get("/availability/by-state", tags=["Availability"])
+async def availability_by_state(
+    state:    str           = Query(..., description="US state name, or any value for outside US"),
+    date:     str           = Query(..., description="YYYY-MM-DD"),
+    timezone: str           = Query("America/New_York"),
+    typeIDs:  Optional[str] = Query(None),   # ← new param, Caspio can pass this optionally
+):
+    state = STATE_NORMALIZER.get(state.strip().lower(), state.strip())
+
+    # If typeIDs not passed, look up from Caspio State_TypeID_Map table
+    if not typeIDs:
+        typeIDs = await fetch_allowed_type_ids(state)
+        log.info("typeIDs from Caspio lookup for state=%s: %s", state, typeIDs)
+
+    async with httpx.AsyncClient(timeout=15) as client:
+        types_resp = await client.get(
+            f"{ACUITY_BASE}/appointment-types",
+            headers=acuity_headers()
+        )
+    if types_resp.status_code != 200:
+        raise HTTPException(500, "Could not fetch appointment types")
+
+    all_types = types_resp.json()
+
+    # ── TYPE FILTERING ───────────────────────────────────────────────
+    if typeIDs:
+        # Caspio map is source of truth — only these IDs allowed
+        allowed = set(int(x.strip()) for x in typeIDs.split(",") if x.strip())
+        matched_types = [
+            t for t in all_types
+            if t["id"] in allowed
+            and is_50min_psych_eval(t)
+            and t["id"] not in TEST_TYPE_IDS
+        ]
+        log.info("typeID filter active — allowed=%s matched=%s", len(allowed), len(matched_types))
+    else:
+        # Fallback — keyword routing (Caspio table missing/empty for this state)
+        matched_types = get_matched_types(all_types, state)
+        log.info("typeID filter inactive — keyword fallback, matched=%s", len(matched_types))
+
+    if not matched_types:
+        return {
+            "state":   state,
+            "date":    date,
+            "message": "No 50-minute Psychological Evaluation types found",
+            "slots":   []
+        }
+
+    # ── everything below this line is UNCHANGED from your original ───
+
+    cal_to_types_list = defaultdict(list)
+    for apt_type in matched_types:
+        for cal_id in apt_type.get("calendarIDs", []):
+            cal_to_types_list[cal_id].append({
+                "appointmentTypeID": apt_type["id"],
+                "schedulingUrl":     apt_type.get("schedulingUrl", ""),
+                "typeName":          apt_type.get("name", ""),
+            })
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        tasks     = []
+        task_meta = []
+        for cal_id, type_infos in cal_to_types_list.items():
+            for info in type_infos:
+                tasks.append(
+                    client.get(
+                        f"{ACUITY_BASE}/availability/times",
+                        headers=acuity_headers(),
+                        params={
+                            "appointmentTypeID": info["appointmentTypeID"],
+                            "calendarID":        cal_id,
+                            "date":              date,
+                            "timezone":          timezone,
+                        }
+                    )
+                )
+                task_meta.append((cal_id, info))
+        responses = await asyncio.gather(*tasks, return_exceptions=True)
+
+    therapist_slots = {}
+    seen_slots      = set()
+
+    for i, resp in enumerate(responses):
+        cal_id, info = task_meta[i]
+        if isinstance(resp, Exception) or resp.status_code != 200:
+            continue
+        for slot in resp.json():
+            if slot.get("slotsAvailable", 0) < 1:
+                continue
+            slot_key = (cal_id, slot["time"])
+            if slot_key in seen_slots:
+                continue
+            seen_slots.add(slot_key)
+
+            if cal_id not in therapist_slots:
+                therapist_slots[cal_id] = {
+                    "calendarID":    cal_id,
+                    "therapistName": extract_doctor_name(info["typeName"]),
+                    "typeName":      info["typeName"],
+                    "bookingUrl":    info["schedulingUrl"],
+                    "typeID":        info["appointmentTypeID"],
+                    "slots":         [],
+                    "totalSlots":    0,
+                }
+            therapist_slots[cal_id]["slots"].append({
+                "time":          slot["time"],
+                "calendarID":    cal_id,
+                "bookingUrl":    info["schedulingUrl"],
+                "typeID":        info["appointmentTypeID"],
+                "therapistName": extract_doctor_name(info["typeName"]),
+            })
+            therapist_slots[cal_id]["totalSlots"] += 1
+
+    for cal_id in therapist_slots:
+        therapist_slots[cal_id]["slots"].sort(key=lambda x: x["time"])
+
+    therapist_list = list(therapist_slots.values())
+    random.shuffle(therapist_list)
+
+    time_buckets = defaultdict(list)
+    for therapist in therapist_list:
+        for slot in therapist["slots"]:
+            time_buckets[slot["time"]].append(slot)
+
+    all_slots = []
+    for time_key in sorted(time_buckets.keys()):
+        all_slots.extend(time_buckets[time_key])
+
+    all_known = set(STATE_KEYWORDS.keys()) | NON_PSYPACT_STATES
+    if state in NON_PSYPACT_STATES:
+        pool = "state-specific"
+    elif state in all_known:
+        pool = "psypact"
+    else:
+        pool = "all"
+
+    return {
+        "state":          state,
+        "date":           date,
+        "timezone":       timezone,
+        "pool":           pool,
+        "totalSlots":     len(all_slots),
+        "matchedTypes":   len(matched_types),
+        "totalCalendars": len(therapist_slots),
+        "therapists":     therapist_list,
+        "slots":          all_slots
+    }
 # ==================================================
 # STATE-BASED AVAILABILITY ROUTES
 # ==================================================
@@ -1131,8 +1294,9 @@ async def debug_types(state: Optional[str] = Query(None)):
         else:
             if state:
                 entry["matches_state"]   = matches_state(t, state)
-                entry["is_non_psypact"]  = is_non_psypact_type(t)
-                entry["in_psypact_pool"] = not is_non_psypact_type(t)
+                entry["route"]           = _route_type(t)
+                entry["is_non_psypact"]  = _route_type(t).startswith("non_psypact")
+                entry["in_psypact_pool"] = _route_type(t) == "psypact"
             passed.append(entry)
 
     matched = get_matched_types(all_types, state) if state else []
