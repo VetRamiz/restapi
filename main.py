@@ -836,7 +836,8 @@ STATE_NORMALIZER: dict[str, str] = {s.lower(): s for s in STATE_TYPE_IDS}
 # Override map: { type_id (int) → [calendar_id, ...] }
 # Source: confirmed from direct Acuity booking URLs.
 CALENDAR_OVERRIDES: dict[int, list[int]] = {
-    44643246: [7083363],  # Dr. Beverly Ibeh — CA (from booking URL /calendar/7083363)
+    44643246: [7083363],   # Dr. Beverly Ibeh — CA (from booking URL /calendar/7083363)
+    55211731: [3522898],  # Dr. Emily Hu — Santa Monica CA  ← ADD THIS
     60953633: [],         # Dr. Emily Hu — Iowa (intentionally no calendar — keep excluded)
     60953734: [],         # Dr. Emily Hu — Texas (intentionally no calendar — keep excluded)
     75935569: [],         # Dr. Chemarum — generic (no calendar — keep excluded)
