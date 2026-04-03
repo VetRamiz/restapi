@@ -864,20 +864,63 @@ async def fetch_allowed_type_ids(state: str) -> Optional[str]:
     return None
 
 
+# Hardcoded — source of truth for which typeIDs are allowed per state
+# To add a new therapist: add their typeID to the correct state list
+STATE_TYPE_IDS: dict = {
+    "California":           "67331536,52823893,55211731,37231009,44643246",
+    "Iowa":                 "72914876,55554634",
+    "New York":             "",
+    "Hawaii":               "",
+    "Alaska":               "",
+    "Oregon":               "",
+    "New Mexico":           "",
+    "Louisiana":            "",
+    "Massachusetts":        "",
+    # All PSYPACT states get the same pool
+    "Indiana":              "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
+    "Pennsylvania":         "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
+    "Texas":                "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
+    "District of Columbia": "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
+    "Virginia":             "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
+    "Illinois":             "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
+    "Arizona":              "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
+    "Colorado":             "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
+    "Connecticut":          "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
+    "Delaware":             "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
+    "Georgia":              "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
+    "Idaho":                "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
+    "Kansas":               "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
+    "Kentucky":             "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
+    "Maine":                "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
+    "Maryland":             "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
+    "Michigan":             "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
+    "Minnesota":            "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
+    "Missouri":             "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
+    "Nebraska":             "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
+    "Nevada":               "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
+    "New Hampshire":        "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
+    "New Jersey":           "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
+    "North Carolina":       "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
+    "North Dakota":         "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
+    "Ohio":                 "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
+    "Rhode Island":         "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
+    "South Carolina":       "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
+    "Tennessee":            "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
+    "Utah":                 "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
+    "Vermont":              "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
+    "West Virginia":        "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
+    "Wisconsin":            "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
+    "Wyoming":              "73689906,73062970,74542331,74804055,55554566,75932446,81046199,81046572,84889378,88803811,74926724,58693634",
+}
+
+
 @app.get("/availability/by-state", tags=["Availability"])
 async def availability_by_state(
-    state:    str           = Query(..., description="US state name, or any value for outside US"),
-    date:     str           = Query(..., description="YYYY-MM-DD"),
-    timezone: str           = Query("America/New_York"),
-    typeIDs:  Optional[str] = Query(None),   # ← new param, Caspio can pass this optionally
+    state:    str = Query(..., description="US state name, or any value for outside US"),
+    date:     str = Query(..., description="YYYY-MM-DD"),
+    timezone: str = Query("America/New_York"),
 ):
     state = STATE_NORMALIZER.get(state.strip().lower(), state.strip())
-    log.info("by-state called — state=%s typeIDs_param=%s", state, typeIDs)  # ← ADD THIS
-    # If typeIDs not passed, look up from Caspio State_TypeID_Map table
-    if not typeIDs:
-        log.info("No typeIDs param — calling fetch_allowed_type_ids")  # ← ADD THIS
-        typeIDs = await fetch_allowed_type_ids(state)
-        log.info("fetch_allowed_type_ids returned: %s", typeIDs)  # ← ADD THIS
 
     async with httpx.AsyncClient(timeout=15) as client:
         types_resp = await client.get(
@@ -889,21 +932,22 @@ async def availability_by_state(
 
     all_types = types_resp.json()
 
-    # ── TYPE FILTERING ───────────────────────────────────────────────
-    if typeIDs:
-        # Caspio map is source of truth — only these IDs allowed
-        allowed = set(int(x.strip()) for x in typeIDs.split(",") if x.strip())
+    # Get allowed typeIDs for this state directly from hardcoded map
+    type_ids_str = STATE_TYPE_IDS.get(state, "")
+
+    if type_ids_str:
+        allowed = set(int(x.strip()) for x in type_ids_str.split(",") if x.strip())
         matched_types = [
             t for t in all_types
             if t["id"] in allowed
             and is_50min_psych_eval(t)
             and t["id"] not in TEST_TYPE_IDS
         ]
-        log.info("typeID filter active — allowed=%s matched=%s", len(allowed), len(matched_types))
+        log.info("state=%s hardcoded filter active — allowed=%s matched=%s", state, len(allowed), len(matched_types))
     else:
-        # Fallback — keyword routing (Caspio table missing/empty for this state)
+        # State not in map at all — outside US, show everything
         matched_types = get_matched_types(all_types, state)
-        log.info("typeID filter inactive — keyword fallback, matched=%s", len(matched_types))
+        log.info("state=%s not in map — keyword fallback matched=%s", state, len(matched_types))
 
     if not matched_types:
         return {
@@ -913,8 +957,7 @@ async def availability_by_state(
             "slots":   []
         }
 
-    # ── everything below this line is UNCHANGED from your original ───
-
+    # ── everything below unchanged ────────────────────────────────────
     cal_to_types_list = defaultdict(list)
     for apt_type in matched_types:
         for cal_id in apt_type.get("calendarIDs", []):
@@ -993,154 +1036,6 @@ async def availability_by_state(
     for time_key in sorted(time_buckets.keys()):
         all_slots.extend(time_buckets[time_key])
 
-    all_known = set(STATE_KEYWORDS.keys()) | NON_PSYPACT_STATES
-    if state in NON_PSYPACT_STATES:
-        pool = "state-specific"
-    elif state in all_known:
-        pool = "psypact"
-    else:
-        pool = "all"
-
-    return {
-        "state":          state,
-        "date":           date,
-        "timezone":       timezone,
-        "pool":           pool,
-        "totalSlots":     len(all_slots),
-        "matchedTypes":   len(matched_types),
-        "totalCalendars": len(therapist_slots),
-        "therapists":     therapist_list,
-        "slots":          all_slots
-    }
-# ==================================================
-# STATE-BASED AVAILABILITY ROUTES
-# ==================================================
-
-@app.get("/availability/by-state", tags=["Availability"])
-async def availability_by_state(
-    state:    str = Query(..., description="US state name, or any value for outside US"),
-    date:     str = Query(..., description="YYYY-MM-DD"),
-    timezone: str = Query("America/New_York"),
-):
-    """
-    ★ MAIN CASPIO ENDPOINT
-
-    Routing:
-    - Non-PSYPACT (CA, NY, IA etc.) → state-specific therapists only
-    - PSYPACT state (Indiana, TX etc.) → full PSYPACT therapist pool
-    - Outside US → all therapists, no filter
-
-    Response includes 'pool' field: 'state-specific' | 'psypact' | 'all'
-    
-    """
-    state = state.strip().title()
-    state = STATE_NORMALIZER.get(state.strip().lower(), state.strip())
-    async with httpx.AsyncClient(timeout=15) as client:
-        types_resp = await client.get(
-            f"{ACUITY_BASE}/appointment-types",
-            headers=acuity_headers()
-        )
-    if types_resp.status_code != 200:
-        raise HTTPException(500, "Could not fetch appointment types")
-
-    matched_types = get_matched_types(types_resp.json(), state)
-
-    if not matched_types:
-        return {
-            "state":   state,
-            "date":    date,
-            "message": "No 50-minute Psychological Evaluation types found",
-            "slots":   []
-        }
-
-    # Build calendarID → LIST of all type infos
-    # Query ALL types per calendar so we catch availability regardless
-    # of which type the therapist configured their schedule against
-    cal_to_types_list = defaultdict(list)
-    for apt_type in matched_types:
-        for cal_id in apt_type.get("calendarIDs", []):
-            cal_to_types_list[cal_id].append({
-                "appointmentTypeID": apt_type["id"],
-                "schedulingUrl":     apt_type.get("schedulingUrl", ""),
-                "typeName":          apt_type.get("name", ""),
-            })
-
-    # Fetch times for ALL types per calendar in parallel
-    async with httpx.AsyncClient(timeout=20) as client:
-        tasks     = []
-        task_meta = []
-        for cal_id, type_infos in cal_to_types_list.items():
-            for info in type_infos:
-                tasks.append(
-                    client.get(
-                        f"{ACUITY_BASE}/availability/times",
-                        headers=acuity_headers(),
-                        params={
-                            "appointmentTypeID": info["appointmentTypeID"],
-                            "calendarID":        cal_id,
-                            "date":              date,
-                            "timezone":          timezone,
-                        }
-                    )
-                )
-                task_meta.append((cal_id, info))
-        responses = await asyncio.gather(*tasks, return_exceptions=True)
-
-    # Build per-therapist slot groups
-    # seen_slots deduplicates same (calendarID + time) across multiple types
-    therapist_slots = {}
-    seen_slots      = set()
-
-    for i, resp in enumerate(responses):
-        cal_id, info = task_meta[i]
-        if isinstance(resp, Exception) or resp.status_code != 200:
-            continue
-        for slot in resp.json():
-            if slot.get("slotsAvailable", 0) < 1:
-                continue
-            slot_key = (cal_id, slot["time"])
-            if slot_key in seen_slots:
-                continue  # already found this time from another type
-            seen_slots.add(slot_key)
-
-            if cal_id not in therapist_slots:
-                therapist_slots[cal_id] = {
-                    "calendarID":    cal_id,
-                    "therapistName": extract_doctor_name(info["typeName"]),
-                    "typeName":      info["typeName"],
-                    "bookingUrl":    info["schedulingUrl"],
-                    "typeID":        info["appointmentTypeID"],
-                    "slots":         [],
-                    "totalSlots":    0,
-                }
-            therapist_slots[cal_id]["slots"].append({
-                "time":          slot["time"],
-                "calendarID":    cal_id,
-                "bookingUrl":    info["schedulingUrl"],
-                "typeID":        info["appointmentTypeID"],
-                "therapistName": extract_doctor_name(info["typeName"]),
-            })
-            therapist_slots[cal_id]["totalSlots"] += 1
-
-    # Sort each therapist's slots by time
-    for cal_id in therapist_slots:
-        therapist_slots[cal_id]["slots"].sort(key=lambda x: x["time"])
-
-    # Shuffle therapist order on every request
-    therapist_list = list(therapist_slots.values())
-    random.shuffle(therapist_list)
-
-    # Interleave by time — within same timeslot therapists are shuffled
-    time_buckets = defaultdict(list)
-    for therapist in therapist_list:
-        for slot in therapist["slots"]:
-            time_buckets[slot["time"]].append(slot)
-
-    all_slots = []
-    for time_key in sorted(time_buckets.keys()):
-        all_slots.extend(time_buckets[time_key])
-
-    # Determine pool label
     all_known = set(STATE_KEYWORDS.keys()) | NON_PSYPACT_STATES
     if state in NON_PSYPACT_STATES:
         pool = "state-specific"
