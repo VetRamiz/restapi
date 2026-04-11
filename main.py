@@ -49,7 +49,7 @@ log = logging.getLogger("acuity-proxy")
 app = FastAPI(
     title="Acuity ↔ Caspio Proxy",
     description="Covers all Acuity availability, appointments, and Caspio sync",
-    version="5.1.0"
+    version="6.0.0"
 )
 
 app.add_middleware(
@@ -638,68 +638,109 @@ async def acuity_webhook(
 
 
 # ==================================================
-# FILTERING — 50-min Psych Eval
+# FILTERING  —  v6.0.0
 # ==================================================
-
-# ── BASE FILTER ────────────────────────────────────────────────────────────────
-# Applied to every type before state routing.
-# Must be 50-min, category must contain "PSYCHOLOGICAL EVALUATION", must have
-# at least one calendar assigned, and must not be a test type.
+#
+# TWO appointment-type families are supported, selected via ?appt_type=
+#
+#   "psych"    (default) — legacy 50-min Psych Eval, manual STATE_TYPE_IDS map
+#   "fertility"          — new Fertility Eval, fully dynamic category-based routing
+#
+# ── SHARED CONSTANTS ──────────────────────────────────────────────────────────
 
 PSYCH_EVAL_CATEGORY_KEYWORD = "PSYCHOLOGICAL EVALUATION"
-ALLOWED_DURATION            = 50
 
-# Test type IDs — always hidden regardless of state.
-# Source: Filtered_Appointments.xlsx — rows with "(TEST" in name.
+# Test types — excluded from ALL families regardless of category.
+# Detected by name prefix "(TEST" — no hard-coded IDs needed going forward,
+# but legacy IDs kept for safety.
 TEST_TYPE_IDS: set = {
-    90824033,  # (TEST 1) Thrive: 50 Min … (Psypact)
-    90822425,  # (TEST 1) Thrive: 50 Min … - California
-    90822613,  # (TEST 2) Thrive: 50 Min … with
-    90822881,  # (TEST 3) Thrive: 50 Min …
-    90826017,  # (TEST 2) Thrive: 50 Min … (PsyPact(
-    90827405,  # (TEST 3) Thrive: 50 Min … (PsyPact)
+    90824033, 90822425, 90822613, 90822881, 90826017, 90827405,
 }
 
-# ── STATE → TYPE ID MAP ────────────────────────────────────────────────────────
+def _is_test_type(apt_type: dict) -> bool:
+    name = apt_type.get("name", "")
+    return apt_type.get("id") in TEST_TYPE_IDS or name.strip().startswith("(TEST")
+
+# ── ALL US STATES (canonical names) ───────────────────────────────────────────
+ALL_US_STATES: set = {
+    "Alabama","Alaska","Arizona","Arkansas","California","Colorado",
+    "Connecticut","Delaware","Florida","Georgia","Hawaii","Idaho",
+    "Illinois","Indiana","Iowa","Kansas","Kentucky","Louisiana",
+    "Maine","Maryland","Massachusetts","Michigan","Minnesota",
+    "Mississippi","Missouri","Montana","Nebraska","Nevada",
+    "New Hampshire","New Jersey","New Mexico","New York",
+    "North Carolina","North Dakota","Ohio","Oklahoma","Oregon",
+    "Pennsylvania","Rhode Island","South Carolina","South Dakota",
+    "Tennessee","Texas","Utah","Vermont","Virginia","Washington",
+    "West Virginia","Wisconsin","Wyoming","District of Columbia",
+}
+_STATE_UPPER_MAP: dict = {s.upper(): s for s in ALL_US_STATES}
+
+# PSYPACT compact states — therapists with this licence show here.
+# Florida and Washington are PSYPACT compact; they ALSO get state-specific
+# non-PSYPACT therapists on top (via THRIVE FLORIDA / THRIVE WASHINGTON category).
+PSYPACT_COMPACT_STATES: set = {
+    "Alabama","Arkansas","Arizona","Colorado","Connecticut","Delaware",
+    "District of Columbia","Florida","Georgia","Idaho","Illinois","Indiana",
+    "Kansas","Kentucky","Maine","Maryland","Massachusetts","Michigan",
+    "Minnesota","Mississippi","Missouri","Montana","Nebraska","Nevada",
+    "New Hampshire","New Jersey","North Carolina","North Dakota","Ohio",
+    "Oklahoma","Pennsylvania","Rhode Island","South Carolina","South Dakota",
+    "Tennessee","Utah","Vermont","Virginia","Washington","West Virginia",
+    "Wisconsin","Wyoming",
+}
+
+# Non-PSYPACT states (for pool label in API response)
+NON_PSYPACT_STATES: set = ALL_US_STATES - PSYPACT_COMPACT_STATES
+# = California, Iowa, Texas, New York, Hawaii, Alaska, Oregon,
+#   New Mexico, Louisiana, Massachusetts + any future additions
+
+# State name normaliser — lower-case → canonical
+STATE_NORMALIZER: dict = {s.lower(): s for s in ALL_US_STATES}
+
+# ── CALENDAR OVERRIDES ────────────────────────────────────────────────────────
+# Acuity sometimes returns calendarIDs=[] for a type that has real availability.
+# Override map: { type_id (int) → [calendar_id, ...] }
+# Source: confirmed from direct Acuity booking URLs /calendar/{ID}.
+# An override of [] means "intentionally excluded — keep dropped even if Acuity
+# later assigns a calendar".
+CALENDAR_OVERRIDES: dict = {
+    44643246: [7083363],  # Dr. Beverly Ibeh — CA psych eval
+    60953633: [],         # Dr. Emily Hu — Iowa psych eval (no calendar)
+    60953734: [],         # Dr. Emily Hu — Texas psych eval (no calendar)
+    75935569: [],         # Dr. Chemarum — generic (no calendar)
+    49484128: [],         # Dr. Toni Leo — generic (no calendar)
+}
+
+def resolve_calendar_ids(apt_type: dict) -> list:
+    """Return effective calendarIDs, applying CALENDAR_OVERRIDES if present."""
+    tid = apt_type.get("id")
+    if tid in CALENDAR_OVERRIDES:
+        overridden = CALENDAR_OVERRIDES[tid]
+        if overridden != apt_type.get("calendarIDs", []):
+            log.info("CALENDAR_OVERRIDE type=%s %s→%s",
+                     tid, apt_type.get("calendarIDs"), overridden)
+        return overridden
+    return apt_type.get("calendarIDs", [])
+
+
+# ==================================================
+# FAMILY 1 — PSYCH EVAL  (manual map, 50-min only)
+# ==================================================
 #
-# DERIVATION (from Filtered_Appointments.xlsx, version 5.0.0):
+# Routing is controlled by STATE_TYPE_IDS.
+# Add a new therapist: add their type ID to the correct string below + redeploy.
 #
-# Each therapist's appointment types have an Acuity category that encodes their
-# practice scope.  The logic is:
-#
-#   "THRIVE CALIFORNIA" category   → CA-ONLY (never shown in other states)
-#   "THRIVE IOWA" category         → Iowa-only
-#   "THRIVE TEXAS" category        → Texas-only
-#   "THRIVE DC" category           → DC-only (+ generic PSYPACT pool)
-#   "THRIVE INDIANA" category      → Indiana-only (+ generic PSYPACT pool)
-#   "THRIVE Pennsylvania" category → PA-only (+ generic PSYPACT pool)
-#   "THRIVE EASTERN TIME" category → not state-locked; added to generic PSYPACT pool
-#   "THRIVE: ..." (generic)        → PSYPACT pool — available in all PSYPACT states
-#
-# ★ Key corrections vs v4.0.0:
-#   • State-specific IDs (Indiana/PA/DC/Texas) were previously bundled into
-#     PSYPACT_IDS and leaked into every PSYPACT state. They are now separated.
-#   • Iowa type 60953633 and Texas type 60953734 both have empty calendarIDs in
-#     Acuity — they are dropped (base filter handles this, but also excluded here
-#     to be explicit and future-proof).
-#   • DC and Indiana each get their OWN state-specific type PLUS the generic
-#     PSYPACT pool (a therapist can be licensed in multiple PSYPACT states).
-#   • PSYPACT_IDS now contains ONLY the truly generic "THRIVE: Psychological
-#     Evaluation" category types plus the Eastern-Time entry (74804055).
-#
-# HOW TO ADD A NEW THERAPIST:
-#   1. Add their appointment type to Acuity with the correct category.
-#   2. Add the new type ID to this map (either to a specific state string or to
-#      PSYPACT_IDS if they are fully PSYPACT).
-#   3. Redeploy — no other code changes needed.
+# Map semantics:
+#   str value  → comma-separated allowed type IDs
+#   ""         → state known, no therapists yet → returns []
+#   (absent)   → international → returns all eligible types
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Generic PSYPACT pool: category = "THRIVE: Psychological Evaluation" (and
-# "THRIVE EASTERN TIME") — licensed in all PSYPACT compact states.
-# IDs with NO calendarIDs in Acuity (75935569, 49484128) are intentionally
-# excluded; they will fail the base filter but are listed here for reference.
-_PSYPACT_GENERIC: str = (
-    "74804055,"   # Dr. Jennifer Alpert — Eastern Time / generic PSYPACT
+PSYCH_EVAL_ALLOWED_DURATION = 50
+
+_PE_PSYPACT: str = (
+    "74804055,"   # Dr. Jennifer Alpert — Eastern Time
     "75932446,"   # Dr. Courtney Cook
     "81046199,"   # Dr. Bethany Young
     "81046572,"   # Dr. Danielle Powers
@@ -708,215 +749,178 @@ _PSYPACT_GENERIC: str = (
     "74926724,"   # Dr. Jennifer Alpert — generic PSYPACT
     "58693634"    # Dr. Charlynn Ruan — generic PSYPACT
 )
-
-# State-specific type IDs (not in PSYPACT pool, or additions on top of it).
-_CA_ONLY: str = (
-    "67331536,"   # Dr. Tamara Rumburg — Santa Monica
-    "52823893,"   # Dr. Megan Cannon   — California ONLY
-    "55211731,"   # Dr. Emily Hu       — Santa Monica
-    "37231009,"   # Dr. Charlynn Ruan  — California entry
-    "44643246"    # Dr. Beverly Ibeh   — California
+_PE_CA: str = (
+    "67331536,"   # Dr. Tamara Rumburg
+    "52823893,"   # Dr. Megan Cannon — CA ONLY
+    "55211731,"   # Dr. Emily Hu
+    "37231009,"   # Dr. Charlynn Ruan
+    "44643246"    # Dr. Beverly Ibeh
 )
+_PE_IOWA:  str = "72914876,55554634"
+_PE_TEXAS: str = "55554566"
+_PE_DC:    str = f"74542331,{_PE_PSYPACT}"
+_PE_IN:    str = f"73689906,{_PE_PSYPACT}"
+_PE_PA:    str = f"73062970,{_PE_PSYPACT}"
 
-_IOWA_ONLY: str = (
-    "72914876,"   # Dr. Jennifer Alpert — Iowa
-    "55554634"    # Dr. Charlynn Ruan  — Iowa
-    # 60953633 intentionally excluded — no calendarIDs in Acuity
-)
-
-_TEXAS_ONLY: str = (
-    "55554566"    # Dr. Charlynn Ruan  — Texas
-    # 60953734 intentionally excluded — no calendarIDs in Acuity
-)
-
-_DC_SPECIFIC: str   = "74542331"   # Dr. Jennifer Alpert — DC category entry
-_IN_SPECIFIC: str   = "73689906"   # Dr. Jennifer Alpert — Indiana category entry
-_PA_SPECIFIC: str   = "73062970"   # Dr. Jennifer Alpert — Pennsylvania category entry
-
-# For states that have their OWN category entry AND should also see the PSYPACT
-# generic pool, concatenate:
-_DC_ALL: str  = f"{_DC_SPECIFIC},{_PSYPACT_GENERIC}"
-_IN_ALL: str  = f"{_IN_SPECIFIC},{_PSYPACT_GENERIC}"
-_PA_ALL: str  = f"{_PA_SPECIFIC},{_PSYPACT_GENERIC}"
-
-# ──────────────────────────────────────────────────────────────────────────────
-# STATE_TYPE_IDS  — the single source of truth consumed by get_allowed_types().
-#
-#   str value  → comma-separated list of allowed appointment type IDs for state
-#   ""         → state is recognised but has NO therapists assigned → return []
-#   (absent)   → state not in map → treat as international → return all eligible
-# ──────────────────────────────────────────────────────────────────────────────
-
-STATE_TYPE_IDS: dict[str, str] = {
-    # ── NON-PSYPACT states: state-specific therapists only ────────────────────
-    "California":    _CA_ONLY,
-    "Iowa":          _IOWA_ONLY,
-    "Texas":         _TEXAS_ONLY,
-
-    # Non-PSYPACT states with no therapists yet → empty string
-    "New York":      "",
-    "Hawaii":        "",
-    "Alaska":        "",
-    "Oregon":        "",
-    "New Mexico":    "",
-    "Louisiana":     "",
-    "Massachusetts": "",
-
-    # ── PSYPACT-compact states with a state-specific entry + generic pool ─────
-    "District of Columbia": _DC_ALL,
-    "Indiana":              _IN_ALL,
-    "Pennsylvania":         _PA_ALL,
-
-    # ── PSYPACT-compact states: generic pool only ─────────────────────────────
-    # NOTE: ALL 50 US states + DC must be listed here. Any state absent from
-    # this map falls through to the "international" branch and returns ALL
-    # types — including California-only ones. That was the Alabama/Florida/etc.
-    # bug in v4 and v5.0.0. Every US state that is not PSYPACT gets the generic
-    # pool (PSYPACT therapists hold licences in those states too) unless they
-    # are non-PSYPACT with no assigned therapists (empty string above).
-    "Alabama":        _PSYPACT_GENERIC,
-    "Arkansas":       _PSYPACT_GENERIC,
-    "Florida":        _PSYPACT_GENERIC,
-    "Mississippi":    _PSYPACT_GENERIC,
-    "Montana":        _PSYPACT_GENERIC,
-    "Oklahoma":       _PSYPACT_GENERIC,
-    "South Dakota":   _PSYPACT_GENERIC,
-    "Washington":     _PSYPACT_GENERIC,
-    "Arizona":        _PSYPACT_GENERIC,
-    "Colorado":       _PSYPACT_GENERIC,
-    "Connecticut":    _PSYPACT_GENERIC,
-    "Delaware":       _PSYPACT_GENERIC,
-    "Georgia":        _PSYPACT_GENERIC,
-    "Idaho":          _PSYPACT_GENERIC,
-    "Illinois":       _PSYPACT_GENERIC,
-    "Kansas":         _PSYPACT_GENERIC,
-    "Kentucky":       _PSYPACT_GENERIC,
-    "Maine":          _PSYPACT_GENERIC,
-    "Maryland":       _PSYPACT_GENERIC,
-    "Michigan":       _PSYPACT_GENERIC,
-    "Minnesota":      _PSYPACT_GENERIC,
-    "Missouri":       _PSYPACT_GENERIC,
-    "Massachusetts":  _PSYPACT_GENERIC,
-    "Nebraska":       _PSYPACT_GENERIC,
-    "Nevada":         _PSYPACT_GENERIC,
-    "New Hampshire":  _PSYPACT_GENERIC,
-    "New Jersey":     _PSYPACT_GENERIC,
-    "North Carolina": _PSYPACT_GENERIC,
-    "North Dakota":   _PSYPACT_GENERIC,
-    "Ohio":           _PSYPACT_GENERIC,
-    "Rhode Island":   _PSYPACT_GENERIC,
-    "South Carolina": _PSYPACT_GENERIC,
-    "Tennessee":      _PSYPACT_GENERIC,
-    "Utah":           _PSYPACT_GENERIC,
-    "Vermont":        _PSYPACT_GENERIC,
-    "Virginia":       _PSYPACT_GENERIC,
-    "West Virginia":  _PSYPACT_GENERIC,
-    "Wisconsin":      _PSYPACT_GENERIC,
-    "Wyoming":        _PSYPACT_GENERIC,
-}
-
-# Convenience set for pool-label logic
-NON_PSYPACT_STATES: set[str] = {
-    "California", "New York", "Hawaii", "Alaska", "Oregon",
-    "New Mexico", "Louisiana",
-    # Iowa and Texas have specific therapists but are not PSYPACT-compact states
-    "Iowa", "Texas",
-    # Non-PSYPACT-compact states that still get the generic PSYPACT pool
-    "Alabama", "Arkansas", "Florida", "Mississippi",
-    "Montana", "Oklahoma", "South Dakota", "Washington",
-}
-
-# State name normaliser — lower-case key → canonical name
-STATE_NORMALIZER: dict[str, str] = {s.lower(): s for s in STATE_TYPE_IDS}
-
-# ── CALENDAR OVERRIDES ────────────────────────────────────────────────────────
-# Some Acuity appointment types return calendarIDs=[] from the API even though
-# the therapist has real availability. This happens when Acuity's internal state
-# gets out of sync (e.g. calendar re-assignment, account changes).
-# Override map: { type_id (int) → [calendar_id, ...] }
-# Source: confirmed from direct Acuity booking URLs.
-CALENDAR_OVERRIDES: dict[int, list[int]] = {
-    44643246: [7083363],   # Dr. Beverly Ibeh — CA (from booking URL /calendar/7083363)
-    55211731: [3522898],  # Dr. Emily Hu — Santa Monica CA  ← ADD THIS
-    60953633: [],         # Dr. Emily Hu — Iowa (intentionally no calendar — keep excluded)
-    60953734: [],         # Dr. Emily Hu — Texas (intentionally no calendar — keep excluded)
-    75935569: [],         # Dr. Chemarum — generic (no calendar — keep excluded)
-    49484128: [],         # Dr. Toni Leo — generic (no calendar — keep excluded)
+STATE_TYPE_IDS: dict = {
+    "California":    _PE_CA,
+    "Iowa":          _PE_IOWA,
+    "Texas":         _PE_TEXAS,
+    "New York":      "", "Hawaii": "", "Alaska": "", "Oregon": "",
+    "New Mexico":    "", "Louisiana": "", "Massachusetts": "",
+    "District of Columbia": _PE_DC,
+    "Indiana":       _PE_IN,
+    "Pennsylvania":  _PE_PA,
+    **{s: _PE_PSYPACT for s in PSYPACT_COMPACT_STATES
+       if s not in ("District of Columbia", "Indiana", "Pennsylvania")},
 }
 
 
-def resolve_calendar_ids(apt_type: dict) -> list:
-    """
-    Return the effective calendarIDs for a type, applying CALENDAR_OVERRIDES
-    when Acuity returns an empty list.  An override of [] means 'intentionally
-    excluded even if Acuity later assigns a calendar'.
-    """
-    tid = apt_type.get("id")
-    if tid in CALENDAR_OVERRIDES:
-        overridden = CALENDAR_OVERRIDES[tid]
-        if overridden != apt_type.get("calendarIDs", []):
-            log.info(
-                "CALENDAR_OVERRIDE applied for type %s: %s → %s",
-                tid, apt_type.get("calendarIDs"), overridden
-            )
-        return overridden
-    return apt_type.get("calendarIDs", [])
-
-
-# ── BASE FILTER ────────────────────────────────────────────────────────────────
-
-def is_50min_psych_eval(apt_type: dict) -> bool:
-    """Return True only if the type passes ALL base criteria."""
-    category = apt_type.get("category", "").upper()
-    if PSYCH_EVAL_CATEGORY_KEYWORD not in category:
+def _is_psych_eval_eligible(apt_type: dict) -> bool:
+    """Base filter for the Psych Eval family."""
+    cat = apt_type.get("category", "").upper()
+    if PSYCH_EVAL_CATEGORY_KEYWORD not in cat:
         return False
     try:
-        if int(apt_type.get("duration", 0)) != ALLOWED_DURATION:
+        if int(apt_type.get("duration", 0)) != PSYCH_EVAL_ALLOWED_DURATION:
             return False
     except (TypeError, ValueError):
         return False
-    # Use resolved calendar IDs (respects CALENDAR_OVERRIDES)
     if not resolve_calendar_ids(apt_type):
         return False
-    if apt_type.get("id") in TEST_TYPE_IDS:
+    if _is_test_type(apt_type):
+        return False
+    # Exclude fertility categories — they share the keyword but are a separate family
+    if "PSYPACT" in cat or "NON-PSYPACT" in cat:
         return False
     return True
 
 
-def get_allowed_types(all_types: list, state: str) -> list:
-    """
-    Return the subset of Acuity appointment types that should be shown for
-    *state*.  Uses STATE_TYPE_IDS as the sole source of truth.
-
-    Steps:
-      1. Look up the comma-separated allowed-ID string for the state.
-      2. Filter all_types to those whose id is in that set AND pass the base
-         filter (50-min, has calendar, not a test type).
-      3. For states absent from the map (international), return all types that
-         pass the base filter.
-    """
+def get_allowed_types_psych(all_types: list, state: str) -> list:
+    """Return Psych Eval types allowed for *state* using the manual map."""
     type_ids_str = STATE_TYPE_IDS.get(state)
 
     if type_ids_str is None:
-        # State not in map → international / unknown → show everything eligible
-        log.info("state=%s not in map (international) — returning all eligible types", state)
-        return [t for t in all_types if is_50min_psych_eval(t)]
+        log.info("psych state=%s → international, returning all eligible", state)
+        return [t for t in all_types if _is_psych_eval_eligible(t)]
 
     if type_ids_str == "":
-        # State is known but no therapists assigned yet
-        log.info("state=%s known but no typeIDs assigned — returning empty list", state)
+        log.info("psych state=%s → known, no types assigned", state)
         return []
 
     allowed_ids = {int(x.strip()) for x in type_ids_str.split(",") if x.strip()}
-    matched = [
-        t for t in all_types
-        if t["id"] in allowed_ids and is_50min_psych_eval(t)
-    ]
-    log.info(
-        "VERSION=5.1.0 state=%s allowed_ids=%d matched=%d",
-        state, len(allowed_ids), len(matched)
-    )
+    matched = [t for t in all_types
+               if t["id"] in allowed_ids and _is_psych_eval_eligible(t)]
+    log.info("psych VERSION=6.0.0 state=%s allowed=%d matched=%d",
+             state, len(allowed_ids), len(matched))
     return matched
+
+
+# ==================================================
+# FAMILY 2 — FERTILITY EVAL  (fully dynamic)
+# ==================================================
+#
+# No manual ID list. Routing is derived 100% from Acuity category + name.
+#
+# NAMING CONVENTION (must be followed in Acuity):
+#
+# Category                                    → Routes to
+# ─────────────────────────────────────────── ──────────────────────────────────
+# THRIVE: Psychological Evaluation PSYPACT    → all PSYPACT compact states
+# THRIVE CALIFORNIA: Psychological Evaluation → California only
+# THRIVE FLORIDA: Psychological Evaluation    → Florida only  (+ PSYPACT pool)
+# THRIVE WASHINGTON: Psychological Evaluation → Washington only (+ PSYPACT pool)
+# THRIVE NON-PSYPACT: Psychological Evaluation→ state parsed from TYPE NAME
+#   Type name must start: "Thrive {STATE NAME}: Fertility ..."
+#
+# Duration: any (mix allowed).
+# Test types (name starts with "(TEST"): always excluded.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Category markers (upper-cased for comparison)
+_FERT_CAT_PSYPACT     = "PSYPACT"          # present in PSYPACT category
+_FERT_CAT_NON_PSYPACT = "NON-PSYPACT"      # present in NON-PSYPACT category
+
+
+def _extract_state_from_name(name: str) -> Optional[str]:
+    """
+    Parse state from a type name like 'Thrive ALASKA: Fertility ...'.
+    Returns canonical state name or None if not parseable.
+    """
+    m = re.match(r"^Thrive\s+([A-Z][A-Z\s]+?):\s+", name, re.IGNORECASE)
+    if not m:
+        return None
+    return _STATE_UPPER_MAP.get(m.group(1).strip().upper())
+
+
+def _fertility_routed_states(apt_type: dict) -> set:
+    """
+    Return the set of states this fertility type should appear in.
+    Empty set means the type should not appear anywhere (bad category / test).
+    """
+    cat = apt_type.get("category", "").upper()
+    name = apt_type.get("name", "")
+
+    if PSYCH_EVAL_CATEGORY_KEYWORD not in cat:
+        return set()
+    if _is_test_type(apt_type):
+        return set()
+    if not resolve_calendar_ids(apt_type):
+        return set()
+
+    if _FERT_CAT_PSYPACT in cat and _FERT_CAT_NON_PSYPACT not in cat:
+        # PSYPACT pool → all PSYPACT compact states
+        return set(PSYPACT_COMPACT_STATES)
+
+    if _FERT_CAT_NON_PSYPACT in cat:
+        # State encoded in type name
+        state = _extract_state_from_name(name)
+        if state:
+            return {state}
+        log.warning("fertility NON-PSYPACT type '%s' has unparseable name — skipped", name)
+        return set()
+
+    # State-specific category: 'THRIVE {STATE}: ...'
+    # Extract state from category prefix e.g. 'THRIVE CALIFORNIA:'
+    m = re.match(r"^THRIVE\s+([A-Z][A-Z\s]+?):", cat)
+    if m:
+        state = _STATE_UPPER_MAP.get(m.group(1).strip().upper())
+        if state:
+            return {state}
+
+    log.warning("fertility type '%s' has unrecognised category '%s' — skipped",
+                name, apt_type.get("category", ""))
+    return set()
+
+
+def get_allowed_types_fertility(all_types: list, state: str) -> list:
+    """
+    Return Fertility types for *state* using fully dynamic category routing.
+    Called once per request; iterates all Acuity types and checks each one.
+    """
+    matched = []
+    for t in all_types:
+        routed = _fertility_routed_states(t)
+        if state in routed:
+            matched.append(t)
+    log.info("fertility VERSION=6.0.0 state=%s matched=%d", state, len(matched))
+    return matched
+
+
+# ==================================================
+# UNIFIED DISPATCHER
+# ==================================================
+
+def get_allowed_types(all_types: list, state: str,
+                      appt_type: str = "psych") -> list:
+    """
+    Route to the correct filtering family based on appt_type param.
+      "psych"    → manual map (Psych Eval)
+      "fertility"→ dynamic category routing (Fertility Eval)
+    """
+    if appt_type == "fertility":
+        return get_allowed_types_fertility(all_types, state)
+    return get_allowed_types_psych(all_types, state)
 
 
 def extract_doctor_name(type_name: str) -> str:
@@ -931,12 +935,17 @@ def extract_doctor_name(type_name: str) -> str:
 
 @app.get("/availability/by-state", tags=["Availability"])
 async def availability_by_state(
-    state:    str = Query(..., description="US state name, or any value for outside US"),
-    date:     str = Query(..., description="YYYY-MM-DD"),
-    timezone: str = Query("America/New_York"),
+    state:     str = Query(..., description="US state name, or any value for outside US"),
+    date:      str = Query(..., description="YYYY-MM-DD"),
+    timezone:  str = Query("America/New_York"),
+    appt_type: str = Query("psych", description="'psych' (default) or 'fertility'"),
 ):
     state = STATE_NORMALIZER.get(state.strip().lower(), state.strip())
-    log.info("availability/by-state called — state=%s date=%s", state, date)
+    appt_type = appt_type.strip().lower()
+    if appt_type not in ("psych", "fertility"):
+        raise HTTPException(400, "appt_type must be 'psych' or 'fertility'")
+    log.info("availability/by-state called — state=%s date=%s appt_type=%s",
+             state, date, appt_type)
 
     async with httpx.AsyncClient(timeout=15) as client:
         types_resp = await client.get(
@@ -946,14 +955,15 @@ async def availability_by_state(
     if types_resp.status_code != 200:
         raise HTTPException(500, "Could not fetch appointment types")
 
-    matched_types = get_allowed_types(types_resp.json(), state)
+    matched_types = get_allowed_types(types_resp.json(), state, appt_type)
 
     if not matched_types:
         return {
-            "state":   state,
-            "date":    date,
-            "message": "No 50-minute Psychological Evaluation types found for this state",
-            "slots":   []
+            "state":     state,
+            "date":      date,
+            "appt_type": appt_type,
+            "message":   "No appointment types found for this state",
+            "slots":     []
         }
 
     cal_to_types_list: dict = defaultdict(list)
@@ -1034,7 +1044,12 @@ async def availability_by_state(
     for time_key in sorted(time_buckets.keys()):
         all_slots.extend(time_buckets[time_key])
 
-    if state in NON_PSYPACT_STATES:
+    if appt_type == "fertility":
+        if state in PSYPACT_COMPACT_STATES:
+            pool = "psypact+state-specific" if state in {"Florida", "Washington"} else "psypact"
+        else:
+            pool = "state-specific"
+    elif state in NON_PSYPACT_STATES:
         pool = "state-specific"
     elif state in STATE_TYPE_IDS:
         pool = "psypact"
@@ -1045,6 +1060,7 @@ async def availability_by_state(
         "state":          state,
         "date":           date,
         "timezone":       timezone,
+        "appt_type":      appt_type,
         "pool":           pool,
         "totalSlots":     len(all_slots),
         "matchedTypes":   len(matched_types),
@@ -1056,15 +1072,20 @@ async def availability_by_state(
 
 @app.get("/availability/dates-by-state", tags=["Availability"])
 async def availability_dates_by_state(
-    state:    str           = Query(..., description="US state name, or any value for outside US"),
-    month:    Optional[str] = Query(None, description="YYYY-MM. Defaults to current month"),
-    timezone: str           = Query("America/New_York"),
+    state:     str           = Query(..., description="US state name, or any value for outside US"),
+    month:     Optional[str] = Query(None, description="YYYY-MM. Defaults to current month"),
+    timezone:  str           = Query("America/New_York"),
+    appt_type: str           = Query("psych", description="'psych' (default) or 'fertility'"),
 ):
     if not month:
         month = datetime.now().strftime("%Y-%m")
 
     state = STATE_NORMALIZER.get(state.strip().lower(), state.strip())
-    log.info("availability/dates-by-state called — state=%s month=%s", state, month)
+    appt_type = appt_type.strip().lower()
+    if appt_type not in ("psych", "fertility"):
+        raise HTTPException(400, "appt_type must be 'psych' or 'fertility'")
+    log.info("availability/dates-by-state called — state=%s month=%s appt_type=%s",
+             state, month, appt_type)
 
     async with httpx.AsyncClient(timeout=15) as client:
         types_resp = await client.get(
@@ -1074,7 +1095,7 @@ async def availability_dates_by_state(
     if types_resp.status_code != 200:
         raise HTTPException(500, "Could not fetch appointment types")
 
-    matched_types = get_allowed_types(types_resp.json(), state)
+    matched_types = get_allowed_types(types_resp.json(), state, appt_type)
 
     if not matched_types:
         return {"state": state, "month": month, "dates": []}
@@ -1146,13 +1167,17 @@ async def test_caspio():
 
 
 @app.get("/admin/debug-types", tags=["Admin"])
-async def debug_types(state: Optional[str] = Query(None)):
+async def debug_types(
+    state:     Optional[str] = Query(None),
+    appt_type: str           = Query("psych", description="'psych' or 'fertility'"),
+):
     async with httpx.AsyncClient(timeout=15) as client:
         types_resp = await client.get(
             f"{ACUITY_BASE}/appointment-types",
             headers=acuity_headers()
         )
     all_types = types_resp.json()
+    appt_type = appt_type.strip().lower()
 
     passed, failed = [], []
     for t in all_types:
@@ -1162,22 +1187,19 @@ async def debug_types(state: Optional[str] = Query(None)):
 
         if PSYCH_EVAL_CATEGORY_KEYWORD not in category:
             reasons.append(f"category missing 'PSYCHOLOGICAL EVALUATION': {t.get('category')}")
-        try:
-            if int(duration) != ALLOWED_DURATION:
-                reasons.append(f"duration {duration} != 50")
-        except Exception:
-            reasons.append(f"invalid duration: {duration}")
-        if not t.get("calendarIDs"):
-            reasons.append("no calendarIDs assigned")
-        if t["id"] in TEST_TYPE_IDS:
+        # Use resolve_calendar_ids so CALENDAR_OVERRIDES are respected in debug output
+        if not resolve_calendar_ids(t):
+            reasons.append("no calendarIDs assigned (after overrides)")
+        if _is_test_type(t):
             reasons.append("test type — excluded")
 
         entry = {
-            "id":        t["id"],
-            "name":      t.get("name", ""),
-            "category":  t.get("category", ""),
-            "duration":  duration,
-            "calendars": t.get("calendarIDs", []),
+            "id":               t["id"],
+            "name":             t.get("name", ""),
+            "category":         t.get("category", ""),
+            "duration":         duration,
+            "calendars_raw":    t.get("calendarIDs", []),
+            "calendars_eff":    resolve_calendar_ids(t),
         }
         if reasons:
             entry["filtered_reason"] = reasons
@@ -1185,21 +1207,23 @@ async def debug_types(state: Optional[str] = Query(None)):
         else:
             if state:
                 state_norm = STATE_NORMALIZER.get(state.strip().lower(), state.strip())
-                ids_for_state = {
-                    int(x) for x in STATE_TYPE_IDS.get(state_norm, "").split(",") if x.strip()
-                }
-                entry["in_state_map"] = t["id"] in ids_for_state
-                entry["pool"] = (
-                    "state-specific" if state_norm in NON_PSYPACT_STATES
-                    else "psypact" if state_norm in STATE_TYPE_IDS
-                    else "international"
-                )
+                if appt_type == "fertility":
+                    routed = _fertility_routed_states(t)
+                    entry["routed_states_sample"] = sorted(routed)[:10]
+                    entry["in_state"]             = state_norm in routed
+                else:
+                    ids_for_state = {
+                        int(x) for x in STATE_TYPE_IDS.get(state_norm, "").split(",") if x.strip()
+                    }
+                    entry["in_state_map"] = t["id"] in ids_for_state
             passed.append(entry)
 
-    matched = get_allowed_types(all_types, STATE_NORMALIZER.get(state.strip().lower(), state.strip())) if state else []
+    state_norm = STATE_NORMALIZER.get(state.strip().lower(), state.strip()) if state else None
+    matched = get_allowed_types(all_types, state_norm, appt_type) if state_norm else []
 
     return {
-        "version":            "5.0.0",
+        "version":            "6.0.0",
+        "appt_type":          appt_type,
         "total_types":        len(all_types),
         "passed_base_filter": len(passed),
         "failed_base_filter": len(failed),
