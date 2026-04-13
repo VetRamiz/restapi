@@ -737,7 +737,7 @@ def resolve_calendar_ids(apt_type: dict) -> list:
 #   (absent)   → international → returns all eligible types
 # ──────────────────────────────────────────────────────────────────────────────
 
-PSYCH_EVAL_ALLOWED_DURATION = 50
+
 
 _PE_PSYPACT: str = (
     "74804055,"   # Dr. Jennifer Alpert — Eastern Time
