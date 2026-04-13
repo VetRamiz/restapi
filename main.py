@@ -878,14 +878,12 @@ def _fertility_routed_states(apt_type: dict) -> set:
     # Guard: only treat as a fertility type if the name contains "FERTILITY"
     # or "EVALUATION" — prevents psych types (which share the same category
     # prefix) from being picked up as fertility types.
-    if "FERTILITY" not in name.upper() and "EVALUATION" not in name.upper():
+    if "FERTILITY" not in name.upper():
         return set()
 
-    m = re.match(r"^THRIVE\s+([A-Z][A-Z\s]+?):", cat)
-    if m:
-        state = _STATE_UPPER_MAP.get(m.group(1).strip().upper())
-        if state:
-            return {state}
+    for state_name in ALL_US_STATES:
+        if state_name.upper() in cat:
+            return {state_name}
 
     log.warning("fertility type '%s' has unrecognised category '%s' — skipped",
                 name, apt_type.get("category", ""))
