@@ -837,14 +837,10 @@ _FERT_CAT_NON_PSYPACT = "NON-PSYPACT"      # present in NON-PSYPACT category
 
 
 def _extract_state_from_name(name: str) -> Optional[str]:
-    """
-    Parse state from a type name like 'Thrive ALASKA: Fertility ...'.
-    Returns canonical state name or None if not parseable.
-    """
-    m = re.match(r"^Thrive\s+([A-Z][A-Z\s]+?):\s+", name, re.IGNORECASE)
-    if not m:
-        return None
-    return _STATE_UPPER_MAP.get(m.group(1).strip().upper())
+    for state_name in ALL_US_STATES:
+        if state_name.upper() in name.upper():
+            return state_name
+    return None
 
 
 def _fertility_routed_states(apt_type: dict) -> set:
