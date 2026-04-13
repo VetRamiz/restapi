@@ -809,116 +809,105 @@ def get_allowed_types_psych(all_types: list, state: str) -> list:
              state, len(allowed_ids), len(matched))
     return matched
 
-
 # ==================================================
-# FAMILY 2 — FERTILITY EVAL  (fully dynamic)
+# FAMILY 2 — FERTILITY EVAL  (CLEAN v7 — robust)
 # ==================================================
 #
-# No manual ID list. Routing is derived 100% from Acuity category + name.
+# ✔ No regex
+# ✔ No fragile parsing
+# ✔ Works with messy Acuity data (missing spaces, inconsistent naming)
+# ✔ Supports:
+#     - PSYPACT
+#     - California
+#     - Non-PSYPACT states (from name)
+#     - Florida/Washington mixed behavior
 #
-# NAMING CONVENTION (must be followed in Acuity):
+# Routing Rules (based on REAL data):
 #
-# Category                                    → Routes to
-# ─────────────────────────────────────────── ──────────────────────────────────
-# THRIVE: Psychological Evaluation PSYPACT    → all PSYPACT compact states
-# THRIVE CALIFORNIA: Psychological Evaluation → California only
-# THRIVE FLORIDA: Psychological Evaluation    → Florida only  (+ PSYPACT pool)
-# THRIVE WASHINGTON: Psychological Evaluation → Washington only (+ PSYPACT pool)
-# THRIVE NON-PSYPACT: Psychological Evaluation→ state parsed from TYPE NAME
-#   Type name must start: "Thrive {STATE NAME}: Fertility ..."
+# 1. PSYPACT category → all PSYPACT compact states
+# 2. CALIFORNIA category → California only
+# 3. NON-PSYPACT category → state detected from NAME
+# 4. Fallback → detect state from name/category (handles messy data)
 #
-# Duration: any (mix allowed).
-# Test types (name starts with "(TEST"): always excluded.
-# ──────────────────────────────────────────────────────────────────────────────
-
-# Category markers (upper-cased for comparison)
-_FERT_CAT_PSYPACT     = "PSYPACT"          # present in PSYPACT category
-_FERT_CAT_NON_PSYPACT = "NON-PSYPACT"      # present in NON-PSYPACT category
+# IMPORTANT:
+# ❌ Do NOT filter by calendarIDs here
+# --------------------------------------------------
 
 
-def _extract_state_from_name(name: str) -> Optional[str]:
-    for state_name in ALL_US_STATES:
-        if state_name.upper() in name.upper():
-            return state_name
-    return None
-
-
-def _fertility_routed_states(apt_type: dict) -> set:
-    """
-    Return the set of states this fertility type should appear in.
-    Empty set means the type should not appear anywhere (bad category / test).
-    """
-    cat = apt_type.get("category", "").upper()
-    name = apt_type.get("name", "")
-
-    if PSYCH_EVAL_CATEGORY_KEYWORD not in cat:
-        return set()
-    if _is_test_type(apt_type):
-        return set()
-    if not resolve_calendar_ids(apt_type):
-        return set()
-
-    if _FERT_CAT_PSYPACT in cat and _FERT_CAT_NON_PSYPACT not in cat:
-        # PSYPACT pool → all PSYPACT compact states
-        return set(PSYPACT_COMPACT_STATES)
-
-    if _FERT_CAT_NON_PSYPACT in cat:
-        # State encoded in type name
-        state = _extract_state_from_name(name)
-        if state:
-            return {state}
-        log.warning("fertility NON-PSYPACT type '%s' has unparseable name — skipped", name)
-        return set()
-
-    # State-specific category: 'THRIVE {STATE}: ...'
-    # Guard: only treat as a fertility type if the name contains "FERTILITY"
-    # or "EVALUATION" — prevents psych types (which share the same category
-    # prefix) from being picked up as fertility types.
-    if "FERTILITY" not in name.upper():
-        return set()
-
-    for state_name in ALL_US_STATES:
-        if state_name.upper() in cat:
-            return {state_name}
-
-    log.warning("fertility type '%s' has unrecognised category '%s' — skipped",
-                name, apt_type.get("category", ""))
-    return set()
+def _detect_states_from_text(text: str) -> set:
+    """Return all US states found in text."""
+    text = (text or "").upper()
+    return {s for s in ALL_US_STATES if s.upper() in text}
 
 
 def get_allowed_types_fertility(all_types: list, state: str) -> list:
     """
-    Return Fertility types for *state* using fully dynamic category routing.
-
-    Special case — Outside US / international:
-    If *state* is not a recognised US state, return ALL eligible fertility
-    types so international patients can book with any available therapist.
-    Same behaviour as the psych family for international users.
+    Clean fertility filtering based on real Acuity data patterns.
     """
+
+    state = STATE_NORMALIZER.get(state.strip().lower(), state.strip())
+
+    # -----------------------------------------
+    # INTERNATIONAL USERS (outside US)
+    # -----------------------------------------
     if state not in ALL_US_STATES:
-        # International — return all FERTILITY-family types (not psych-only types)
-        # A type is fertility-family if it has PSYPACT/NON-PSYPACT in its category
-        # or "FERTILITY" in its name. This prevents plain 50-min psych eval types
-        # from leaking into fertility results for international users.
         matched = [
             t for t in all_types
-            if PSYCH_EVAL_CATEGORY_KEYWORD in t.get("category", "").upper()
+            if "PSYCHOLOGICAL EVALUATION" in (t.get("category") or "").upper()
             and not _is_test_type(t)
-            and resolve_calendar_ids(t)
-            and (
-                _FERT_CAT_PSYPACT    in t.get("category", "").upper()
-                or _FERT_CAT_NON_PSYPACT in t.get("category", "").upper()
-                or "FERTILITY" in t.get("name", "").upper()
-            )
+            and "FERTILITY" in (t.get("name") or "").upper()
         ]
         log.info("fertility international state=%s matched=%d", state, len(matched))
         return matched
 
+    # -----------------------------------------
+    # NORMAL STATE FILTERING
+    # -----------------------------------------
     matched = []
+
     for t in all_types:
-        if state in _fertility_routed_states(t):
+        cat  = (t.get("category") or "").upper()
+        name = (t.get("name") or "").upper()
+
+        # -----------------------------------------
+        # BASE FILTERS
+        # -----------------------------------------
+        if "PSYCHOLOGICAL EVALUATION" not in cat:
+            continue
+
+        if _is_test_type(t):
+            continue
+
+        if "FERTILITY" not in name:
+            continue
+
+        # -----------------------------------------
+        # ROUTING LOGIC
+        # -----------------------------------------
+
+        # 1. PSYPACT → all compact states
+        if "PSYPACT" in cat and "NON-PSYPACT" not in cat:
+            if state in PSYPACT_COMPACT_STATES:
+                matched.append(t)
+            continue
+
+        # 2. CALIFORNIA → explicit category
+        if "CALIFORNIA" in cat:
+            if state == "California":
+                matched.append(t)
+            continue
+
+        # 3. NON-PSYPACT → detect from NAME
+        if "NON-PSYPACT" in cat:
+            if state in _detect_states_from_text(name):
+                matched.append(t)
+            continue
+
+        # 4. FALLBACK → detect from both name + category
+        if state in _detect_states_from_text(cat + " " + name):
             matched.append(t)
-    log.info("fertility VERSION=6.2.0 state=%s matched=%d", state, len(matched))
+
+    log.info("fertility CLEAN v7 state=%s matched=%d", state, len(matched))
     return matched
 
 
@@ -926,13 +915,7 @@ def get_allowed_types_fertility(all_types: list, state: str) -> list:
 # UNIFIED DISPATCHER
 # ==================================================
 
-def get_allowed_types(all_types: list, state: str,
-                      appt_type: str = "psych") -> list:
-    """
-    Route to the correct filtering family based on appt_type param.
-      "psych"    → manual map (Psych Eval)
-      "fertility"→ dynamic category routing (Fertility Eval)
-    """
+def get_allowed_types(all_types: list, state: str, appt_type: str = "psych") -> list:
     if appt_type == "fertility":
         return get_allowed_types_fertility(all_types, state)
     return get_allowed_types_psych(all_types, state)
@@ -1202,9 +1185,7 @@ async def debug_types(
 
         if PSYCH_EVAL_CATEGORY_KEYWORD not in category:
             reasons.append(f"category missing 'PSYCHOLOGICAL EVALUATION': {t.get('category')}")
-        # Use resolve_calendar_ids so CALENDAR_OVERRIDES are respected in debug output
-        if not resolve_calendar_ids(t):
-            reasons.append("no calendarIDs assigned (after overrides)")
+        
         if _is_test_type(t):
             reasons.append("test type — excluded")
 
@@ -1223,9 +1204,8 @@ async def debug_types(
             if state:
                 state_norm = STATE_NORMALIZER.get(state.strip().lower(), state.strip())
                 if appt_type == "fertility":
-                    routed = _fertility_routed_states(t)
-                    entry["routed_states_sample"] = sorted(routed)[:10]
-                    entry["in_state"]             = state_norm in routed
+                    allowed = get_allowed_types_fertility([t], state_norm)
+                    entry["in_state"] = len(allowed) > 0
                 else:
                     ids_for_state = {
                         int(x) for x in STATE_TYPE_IDS.get(state_norm, "").split(",") if x.strip()
