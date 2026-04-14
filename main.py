@@ -737,7 +737,7 @@ def resolve_calendar_ids(apt_type: dict) -> list:
 #   (absent)   → international → returns all eligible types
 # ──────────────────────────────────────────────────────────────────────────────
 
-PSYCH_EVAL_ALLOWED_DURATION = 50
+
 
 _PE_PSYPACT: str = (
     "74804055,"   # Dr. Jennifer Alpert — Eastern Time
@@ -781,11 +781,7 @@ def _is_psych_eval_eligible(apt_type: dict) -> bool:
     cat = apt_type.get("category", "").upper()
     if PSYCH_EVAL_CATEGORY_KEYWORD not in cat:
         return False
-    try:
-        if int(apt_type.get("duration", 0)) != PSYCH_EVAL_ALLOWED_DURATION:
-            return False
-    except (TypeError, ValueError):
-        return False
+    
     if not resolve_calendar_ids(apt_type):
         return False
     if _is_test_type(apt_type):
