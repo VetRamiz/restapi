@@ -678,7 +678,8 @@ async def acuity_webhook(
 #
 # =============================================================================
 
-PSYCH_EVAL_CATEGORY_KEYWORD = "PSYCHOLOGICAL EVALUATION"
+PSYCH_EVAL_CATEGORY_KEYWORD  = "PSYCHOLOGICAL EVALUATION"
+FERTILITY_NAME_KEYWORD       = "FERTILITY"   # all target types contain this
 
 # Test type IDs — always excluded regardless of name/category.
 # Legacy hard-coded IDs kept for safety; name-prefix detection handles new ones.
@@ -761,11 +762,16 @@ def _is_eligible(apt_type: dict) -> bool:
     Base eligibility gate applied before any routing.
     A type must:
       - have "PSYCHOLOGICAL EVALUATION" in its category
+      - have "FERTILITY" in its name  ← locks out old 50-min non-fertility
+        psych evals that share the same category but are NOT target types
       - NOT be a test type
       - have at least one calendar ID (after overrides)
     """
-    cat = (apt_type.get("category") or "").upper()
+    cat  = (apt_type.get("category") or "").upper()
+    name = (apt_type.get("name")     or "").upper()
     if PSYCH_EVAL_CATEGORY_KEYWORD not in cat:
+        return False
+    if FERTILITY_NAME_KEYWORD not in name:          # ← the key gate
         return False
     if _is_test_type(apt_type):
         return False
@@ -927,7 +933,7 @@ async def availability_by_state(
     state:     str = Query(..., description="US state name, or any value for outside US"),
     date:      str = Query(..., description="YYYY-MM-DD"),
     timezone:  str = Query("America/New_York"),
-    appt_type: str = Query("psych", description="'psych' (default), 'fertility', or 'both'"),
+    appt_type: str = Query("fertility", description="'fertility' (default), 'psych', or 'both'"),
 ):
     state = STATE_NORMALIZER.get(state.strip().lower(), state.strip())
     appt_type = appt_type.strip().lower()
@@ -1060,7 +1066,7 @@ async def availability_dates_by_state(
     state:     str           = Query(..., description="US state name, or any value for outside US"),
     month:     Optional[str] = Query(None, description="YYYY-MM. Defaults to current month"),
     timezone:  str           = Query("America/New_York"),
-    appt_type: str           = Query("psych", description="'psych' (default), 'fertility', or 'both'"),
+    appt_type: str           = Query("fertility", description="'fertility' (default), 'psych', or 'both'"),
 ):
     if not month:
         month = datetime.now().strftime("%Y-%m")
@@ -1154,7 +1160,7 @@ async def test_caspio():
 @app.get("/admin/debug-types", tags=["Admin"])
 async def debug_types(
     state:     Optional[str] = Query(None),
-    appt_type: str           = Query("psych", description="'psych', 'fertility', or 'both'"),
+    appt_type: str           = Query("fertility", description="'fertility', 'psych', or 'both'"),
 ):
     """
     Shows which types pass/fail base eligibility and, if a state is provided,
