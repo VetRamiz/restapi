@@ -790,10 +790,10 @@ def _is_psych_eval_eligible(apt_type: dict) -> bool:
         return False
     if _is_test_type(apt_type):
         return False
-    # Exclude fertility categories — they share the keyword but are a separate family
-    
-    if "FERTILITY" in apt_type.get("name", "").upper():
-        return False
+    # ↓ DELETE THIS BLOCK — Acuity has renamed ALL types to include "Fertility".
+    # The ID-based STATE_TYPE_IDS map already handles psych vs fertility separation.
+    # if "FERTILITY" in apt_type.get("name", "").upper():
+    #     return False
     return True
 
 
