@@ -638,7 +638,7 @@ async def acuity_webhook(
 
 
 # ==================================================
-# FILTERING  —  v6.0.0
+# FILTERING  —  v7.0.0
 # ==================================================
 #
 # TWO appointment-type families are supported, selected via ?appt_type=
@@ -834,82 +834,78 @@ def get_allowed_types_psych(all_types: list, state: str) -> list:
 # --------------------------------------------------
 
 
-def _detect_states_from_text(text: str) -> set:
-    """Return all US states found in text."""
-    text = (text or "").upper()
-    return {s for s in ALL_US_STATES if s.upper() in text}
+# ===============================
+# IMPORTS (TOP OF FILE)
+# ===============================
+import re
 
 
+# ===============================
+# SHARED HELPERS
+# ===============================
+def _extract_state(name: str) -> str | None:
+    name = name.upper()
+    for s in ALL_US_STATES:
+        if re.search(rf"\b{s}\b", name):
+            return s
+    return None
+
+
+# ===============================
+# PSYCH FILTER (already exists)
+# ===============================
+
+
+# ===============================
+# FERTILITY FILTER (PLACE HERE)
+# ===============================
 def get_allowed_types_fertility(all_types: list, state: str) -> list:
-    """
-    Clean fertility filtering based on real Acuity data patterns.
-    """
+    state = state.upper()
 
-    state = STATE_NORMALIZER.get(state.strip().lower(), state.strip())
-
-    # -----------------------------------------
-    # INTERNATIONAL USERS (outside US)
-    # -----------------------------------------
-    if state not in ALL_US_STATES:
-        matched = [
-            t for t in all_types
-            if "PSYCHOLOGICAL EVALUATION" in (t.get("category") or "").upper()
-            and not _is_test_type(t)
-            and "FERTILITY" in (t.get("name") or "").upper()
-        ]
-        log.info("fertility international state=%s matched=%d", state, len(matched))
-        return matched
-
-    # -----------------------------------------
-    # NORMAL STATE FILTERING
-    # -----------------------------------------
     matched = []
 
     for t in all_types:
-        cat  = (t.get("category") or "").upper()
-        name = (t.get("name") or "").upper()
+        cat  = t.get("category", "").upper()
+        name = t.get("name", "").upper()
 
-        # -----------------------------------------
-        # BASE FILTERS
-        # -----------------------------------------
         if "PSYCHOLOGICAL EVALUATION" not in cat:
             continue
-
         if _is_test_type(t):
             continue
-
-        if "FERTILITY" not in name:
+        if not resolve_calendar_ids(t):
             continue
 
-        # -----------------------------------------
-        # ROUTING LOGIC
-        # -----------------------------------------
-
-        # 1. PSYPACT → all compact states
         if "PSYPACT" in cat and "NON-PSYPACT" not in cat:
             if state in PSYPACT_COMPACT_STATES:
                 matched.append(t)
             continue
 
-        # 2. CALIFORNIA → explicit category
+        if name.startswith("THRIVE:"):
+            if state in PSYPACT_COMPACT_STATES:
+                matched.append(t)
+            continue
+
         if "CALIFORNIA" in cat:
-            if state == "California":
+            if state == "CALIFORNIA":
                 matched.append(t)
             continue
 
-        # 3. NON-PSYPACT → detect from NAME
         if "NON-PSYPACT" in cat:
-            if state in _detect_states_from_text(name):
+            extracted = _extract_state(name)
+            if extracted == state:
                 matched.append(t)
             continue
 
-        # 4. FALLBACK → detect from both name + category
-        if state in _detect_states_from_text(cat + " " + name):
+        extracted = _extract_state(name)
+        if extracted == state:
             matched.append(t)
 
-    log.info("fertility CLEAN v7 state=%s matched=%d", state, len(matched))
     return matched
 
+
+# ===============================
+# FINAL WRAPPER (PLACE LAST)
+# ===============================
 
 # ==================================================
 # UNIFIED DISPATCHER
