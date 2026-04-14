@@ -793,6 +793,8 @@ def _is_psych_eval_eligible(apt_type: dict) -> bool:
     # Exclude fertility categories — they share the keyword but are a separate family
     if "PSYPACT" in cat or "NON-PSYPACT" in cat:
         return False
+    if "FERTILITY" in apt_type.get("name", "").upper():
+        return False
     return True
 
 
@@ -817,35 +819,36 @@ def get_allowed_types_psych(all_types: list, state: str) -> list:
 
 
 # ==================================================
-# FAMILY 2 — FERTILITY EVAL  (fully dynamic)
+# FAMILY 2 — FERTILITY EVAL  (fully dynamic, v7.1)
 # ==================================================
 #
-# No manual ID list. Routing is derived 100% from Acuity category + name.
+# Routing derived entirely from appointment type NAME and CATEGORY.
+# NO duration filter — fertility types are 50 or 60 min (mixed).
+# NO manual ID list.
 #
-# NAMING CONVENTION (must be followed in Acuity):
+# KEY RULE: Name prefix checked FIRST, before category.
+# "Thrive FLORIDA: ..." → Florida only (even though category is PSYPACT)
+# "Thrive PSYPACT: ..."  → PSYPACT is not a US state → falls to PSYPACT pool
+# "Thrive: ..."          → no state prefix → falls to PSYPACT pool
 #
-# Category                                    → Routes to
-# ─────────────────────────────────────────── ──────────────────────────────────
-# THRIVE: Psychological Evaluation PSYPACT    → all PSYPACT compact states
-# THRIVE CALIFORNIA: Psychological Evaluation → California only
-# THRIVE FLORIDA: Psychological Evaluation    → Florida only  (+ PSYPACT pool)
-# THRIVE WASHINGTON: Psychological Evaluation → Washington only (+ PSYPACT pool)
-# THRIVE NON-PSYPACT: Psychological Evaluation→ state parsed from TYPE NAME
-#   Type name must start: "Thrive {STATE NAME}: Fertility ..."
+# Category                              Routes to
+# THRIVE: ... PSYPACT                   All PSYPACT states (if no state in name)
+# THRIVE NON-PSYPACT: ...               State from name prefix
+# THRIVE CALIFORNIA: ...                California (name prefix handles too)
+# Any with "Thrive {STATE}:" in name    That state ONLY
 #
-# Duration: any (mix allowed).
-# Test types (name starts with "(TEST"): always excluded.
-# ──────────────────────────────────────────────────────────────────────────────
+# Test types: id in TEST_TYPE_IDS OR name starts with "(TEST"
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Category markers (upper-cased for comparison)
-_FERT_CAT_PSYPACT     = "PSYPACT"          # present in PSYPACT category
-_FERT_CAT_NON_PSYPACT = "NON-PSYPACT"      # present in NON-PSYPACT category
+_FERT_CAT_PSYPACT     = "PSYPACT"
+_FERT_CAT_NON_PSYPACT = "NON-PSYPACT"
 
 
-def _extract_state_from_name(name: str) -> Optional[str]:
+def _state_from_name_prefix(name: str) -> Optional[str]:
     """
-    Parse state from a type name like 'Thrive ALASKA: Fertility ...'.
-    Returns canonical state name or None if not parseable.
+    Extract US state from 'Thrive FLORIDA: Fertility ...' → 'Florida'.
+    Returns None if prefix is not a valid US state name.
+    e.g. 'Thrive PSYPACT:' → None, 'Thrive:' → None.
     """
     m = re.match(r"^Thrive\s+([A-Z][A-Z\s]+?):\s+", name, re.IGNORECASE)
     if not m:
@@ -853,84 +856,66 @@ def _extract_state_from_name(name: str) -> Optional[str]:
     return _STATE_UPPER_MAP.get(m.group(1).strip().upper())
 
 
-def _fertility_routed_states(apt_type: dict) -> set:
+def _fertility_eligible(apt_type: dict) -> bool:
     """
-    Return the set of states this fertility type should appear in.
-    Empty set means the type should not appear anywhere (bad category / test).
+    Base filter for fertility types.
+    NO duration restriction — fertility types are 50 or 60 min (mixed).
     """
-    cat = apt_type.get("category", "").upper()
-    name = apt_type.get("name", "")
-
+    cat  = (apt_type.get("category") or "").upper()
+    name = (apt_type.get("name")     or "").upper()
     if PSYCH_EVAL_CATEGORY_KEYWORD not in cat:
-        return set()
+        return False
+    if "FERTILITY" not in name:
+        return False
     if _is_test_type(apt_type):
-        return set()
+        return False
     if not resolve_calendar_ids(apt_type):
+        return False
+    return True
+
+
+def _fertility_routes_to(apt_type: dict) -> set:
+    """Return the set of states this fertility type should appear in."""
+    cat  = (apt_type.get("category") or "").upper()
+    name = (apt_type.get("name")     or "")
+
+    if not _fertility_eligible(apt_type):
         return set()
 
+    # Step 1: Name prefix takes priority over category
+    # Handles FL/WA types whose category is PSYPACT but name encodes specific state
+    state_from_name = _state_from_name_prefix(name)
+    if state_from_name:
+        return {state_from_name}
+
+    # Step 2: No US state in name prefix — use category
     if _FERT_CAT_PSYPACT in cat and _FERT_CAT_NON_PSYPACT not in cat:
-        # PSYPACT pool → all PSYPACT compact states
         return set(PSYPACT_COMPACT_STATES)
 
     if _FERT_CAT_NON_PSYPACT in cat:
-        # State encoded in type name
-        state = _extract_state_from_name(name)
-        if state:
-            return {state}
-        log.warning("fertility NON-PSYPACT type '%s' has unparseable name — skipped", name)
+        log.warning("fertility NON-PSYPACT type '%s' has no parseable state in name — skipped", name)
         return set()
 
-    # State-specific category: 'THRIVE {STATE}: ...'
-    # Guard: only treat as a fertility type if the name contains "FERTILITY"
-    # or "EVALUATION" — prevents psych types (which share the same category
-    # prefix) from being picked up as fertility types.
-    if "FERTILITY" not in name.upper() and "EVALUATION" not in name.upper():
-        return set()
+    if "CALIFORNIA" in cat:
+        return {"California"}
 
-    m = re.match(r"^THRIVE\s+([A-Z][A-Z\s]+?):", cat)
-    if m:
-        state = _STATE_UPPER_MAP.get(m.group(1).strip().upper())
-        if state:
-            return {state}
-
-    log.warning("fertility type '%s' has unrecognised category '%s' — skipped",
+    log.warning("fertility type '%s' unrecognised category '%s' — skipped",
                 name, apt_type.get("category", ""))
     return set()
 
 
 def get_allowed_types_fertility(all_types: list, state: str) -> list:
     """
-    Return Fertility types for *state* using fully dynamic category routing.
-
-    Special case — Outside US / international:
-    If *state* is not a recognised US state, return ALL eligible fertility
-    types so international patients can book with any available therapist.
-    Same behaviour as the psych family for international users.
+    Return fertility types for *state*.
+    International (state not in ALL_US_STATES): return all eligible fertility types.
     """
     if state not in ALL_US_STATES:
-        # International — return all FERTILITY-family types (not psych-only types)
-        # A type is fertility-family if it has PSYPACT/NON-PSYPACT in its category
-        # or "FERTILITY" in its name. This prevents plain 50-min psych eval types
-        # from leaking into fertility results for international users.
-        matched = [
-            t for t in all_types
-            if PSYCH_EVAL_CATEGORY_KEYWORD in t.get("category", "").upper()
-            and not _is_test_type(t)
-            and resolve_calendar_ids(t)
-            and (
-                _FERT_CAT_PSYPACT    in t.get("category", "").upper()
-                or _FERT_CAT_NON_PSYPACT in t.get("category", "").upper()
-                or "FERTILITY" in t.get("name", "").upper()
-            )
-        ]
+        matched = [t for t in all_types if _fertility_eligible(t)]
         log.info("fertility international state=%s matched=%d", state, len(matched))
         return matched
 
-    matched = []
-    for t in all_types:
-        if state in _fertility_routed_states(t):
-            matched.append(t)
-    log.info("fertility VERSION=7.1.0 state=%s matched=%d", state, len(matched))
+    matched = [t for t in all_types if state in _fertility_routes_to(t)]
+    log.info("fertility v7.1 state=%s matched=%d", state, len(matched))
     return matched
 
 
@@ -1240,7 +1225,7 @@ async def debug_types(
             if state:
                 state_norm = STATE_NORMALIZER.get(state.strip().lower(), state.strip())
                 if appt_type == "fertility":
-                    routed = _fertility_routed_states(t)
+                    routed = _fertility_routes_to(t)
                     entry["routed_states_sample"] = sorted(routed)[:10]
                     entry["in_state"]             = state_norm in routed
                 else:
