@@ -679,7 +679,7 @@ async def acuity_webhook(
 # =============================================================================
 
 PSYCH_EVAL_CATEGORY_KEYWORD  = "PSYCHOLOGICAL EVALUATION"
-FERTILITY_NAME_KEYWORD       = "FERTILITY"   # all target types contain this
+FERTILITY_NAME_KEYWORD       = "FERTILITY ONLINE"   # all target types contain this
 
 # Test type IDs — always excluded regardless of name/category.
 # Legacy hard-coded IDs kept for safety; name-prefix detection handles new ones.
