@@ -776,26 +776,7 @@ STATE_TYPE_IDS: dict = {
 }
 
 
-def _is_psych_eval_eligible(apt_type: dict) -> bool:
-    """Base filter for the Psych Eval family."""
-    cat = apt_type.get("category", "").upper()
-    if PSYCH_EVAL_CATEGORY_KEYWORD not in cat:
-        return False
-    try:
-        if int(apt_type.get("duration", 0)) != PSYCH_EVAL_ALLOWED_DURATION:
-            return False
-    except (TypeError, ValueError):
-        return False
-    if not resolve_calendar_ids(apt_type):
-        return False
-    if _is_test_type(apt_type):
-        return False
-    # Exclude fertility categories — they share the keyword but are a separate family
-    if "PSYPACT" in cat or "NON-PSYPACT" in cat:
-        return False
-    if "FERTILITY" in apt_type.get("name", "").upper():
-        return False
-    return True
+
 
 
 def get_allowed_types_psych(all_types: list, state: str) -> list:
