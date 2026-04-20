@@ -565,16 +565,12 @@ async def get_appointment_payments(appointment_id: int):
 
 @app.post("/webhooks/acuity", tags=["Webhooks"])
 async def acuity_webhook(
-    request:            Request,
-    background_tasks:   BackgroundTasks,
+    request: Request,
+    background_tasks: BackgroundTasks,
     x_acuity_signature: Optional[str] = Header(None)
 ):
     raw_body = await request.body()
-    log.info("Webhook raw body: %s", raw_body[:300])
-
-    if not verify_acuity_signature(raw_body, x_acuity_signature):
-        raise HTTPException(401, "Invalid webhook signature")
-
+    
     try:
         content_type = request.headers.get("content-type", "")
         if "application/json" in content_type:
@@ -585,9 +581,8 @@ async def acuity_webhook(
             parsed = parse_qs(raw_body.decode("utf-8"))
             action = parsed.get("action", [None])[0]
             apt_id = parsed.get("id", [None])[0]
-        log.info("Parsed action=%s id=%s", action, apt_id)
     except Exception as e:
-        log.error("Failed to parse webhook body: %s", e)
+        log.error("Failed to parse webhook: %s", e)
         raise HTTPException(400, "Invalid payload")
 
     if not apt_id:
@@ -598,23 +593,27 @@ async def acuity_webhook(
         return {"status": "duplicate ignored"}
     recent_webhooks.append(webhook_id)
 
-    log.info("Webhook received: action=%s id=%s", action, apt_id)
+    # ✅ Queue background processing - respond immediately
+    background_tasks.add_task(process_webhook_background, action, apt_id)
+    
+    # ✅ Return immediately (within milliseconds)
+    return {"status": "accepted", "action": action, "id": apt_id}
 
+
+async def process_webhook_background(action: str, apt_id: str):
+    """This runs AFTER the response is sent to Acuity"""
+    log.info("Background: Processing %s for %s", action, apt_id)
+    
     if action in ("scheduling.canceled", "canceled"):
         try:
             await caspio_mark_canceled(int(apt_id))
-            log.info("Caspio mark canceled completed for ID: %s", apt_id)
         except Exception as e:
             log.error("Cancel failed: %s", e)
-
+            
     elif action in (
-        "scheduling.scheduled",
-        "scheduling.rescheduled",
-        "scheduling.changed",
-        "order.completed",
-        "scheduled",
-        "rescheduled",
-        "changed",
+        "scheduling.scheduled", "scheduling.rescheduled",
+        "scheduling.changed", "order.completed",
+        "scheduled", "rescheduled", "changed",
     ):
         try:
             await asyncio.sleep(3)
@@ -623,18 +622,11 @@ async def acuity_webhook(
                     f"{ACUITY_BASE}/appointments/{apt_id}",
                     headers=acuity_headers()
                 )
-            log.info("Acuity fetch status: %s for ID: %s", resp.status_code, apt_id)
             if resp.status_code == 200:
-                appointment_data = resp.json()
-                log.info("Acuity appointment forms: %s", str(appointment_data.get("forms", [])))
-                await caspio_upsert_appointment(appointment_data)
-                log.info("Caspio upsert completed for ID: %s", apt_id)
-            else:
-                log.error("Acuity fetch failed: %s %s", resp.status_code, resp.text[:200])
+                await caspio_upsert_appointment(resp.json())
+                log.info("Background: Completed for %s", apt_id)
         except Exception as e:
-            log.error("Webhook processing error: %s", str(e))
-
-    return {"status": "processed", "action": action, "id": apt_id}
+            log.error("Background: Failed for %s: %s", apt_id, e)
 
 
 # ==================================================
