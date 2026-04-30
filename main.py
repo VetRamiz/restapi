@@ -565,12 +565,15 @@ async def get_appointment_payments(appointment_id: int):
 
 @app.post("/webhooks/acuity", tags=["Webhooks"])
 async def acuity_webhook(
-    request: Request,
-    background_tasks: BackgroundTasks,
+    request:            Request,
+    background_tasks:   BackgroundTasks,
     x_acuity_signature: Optional[str] = Header(None)
 ):
     raw_body = await request.body()
-    
+
+    if not verify_acuity_signature(raw_body, x_acuity_signature):
+        raise HTTPException(401, "Invalid webhook signature")
+
     try:
         content_type = request.headers.get("content-type", "")
         if "application/json" in content_type:
@@ -581,24 +584,65 @@ async def acuity_webhook(
             parsed = parse_qs(raw_body.decode("utf-8"))
             action = parsed.get("action", [None])[0]
             apt_id = parsed.get("id", [None])[0]
+        log.info("Parsed action=%s id=%s", action, apt_id)
     except Exception as e:
-        log.error("Failed to parse webhook: %s", e)
+        log.error("Failed to parse webhook body: %s", e)
         raise HTTPException(400, "Invalid payload")
 
     if not apt_id:
         return {"status": "ignored", "reason": "no appointment id"}
 
-    webhook_id = f"{action}_{apt_id}"
+    # Normalize: treat all upsert-type actions as the same bucket
+    # so "scheduled" + "order.completed" for the same apt_id = one write
+    CANCEL_ACTIONS = {"scheduling.canceled", "canceled"}
+    UPSERT_ACTIONS = {
+        "scheduling.scheduled", "scheduling.rescheduled",
+        "scheduling.changed", "order.completed",
+        "scheduled", "rescheduled", "changed",
+    }
+
+    if action in CANCEL_ACTIONS:
+        bucket = "cancel"
+    elif action in UPSERT_ACTIONS:
+        bucket = "upsert"
+    else:
+        return {"status": "ignored", "reason": f"unknown action {action}"}
+
+    # Dedup key is now apt_id + bucket, not apt_id + specific action
+    webhook_id = f"{bucket}_{apt_id}"
     if webhook_id in recent_webhooks:
+        log.info("Duplicate webhook ignored: %s (original action=%s)", webhook_id, action)
         return {"status": "duplicate ignored"}
     recent_webhooks.append(webhook_id)
 
-    # ✅ Queue background processing - respond immediately
-    background_tasks.add_task(process_webhook_background, action, apt_id)
-    
-    # ✅ Return immediately (within milliseconds)
-    return {"status": "accepted", "action": action, "id": apt_id}
+    log.info("Webhook received: action=%s bucket=%s id=%s", action, bucket, apt_id)
 
+    if bucket == "cancel":
+        try:
+            await caspio_mark_canceled(int(apt_id))
+            log.info("Caspio mark canceled completed for ID: %s", apt_id)
+        except Exception as e:
+            log.error("Cancel failed: %s", e)
+
+    elif bucket == "upsert":
+        try:
+            await asyncio.sleep(3)
+            async with httpx.AsyncClient(timeout=10) as client:
+                resp = await client.get(
+                    f"{ACUITY_BASE}/appointments/{apt_id}",
+                    headers=acuity_headers()
+                )
+            log.info("Acuity fetch status: %s for ID: %s", resp.status_code, apt_id)
+            if resp.status_code == 200:
+                appointment_data = resp.json()
+                await caspio_upsert_appointment(appointment_data)
+                log.info("Caspio upsert completed for ID: %s", apt_id)
+            else:
+                log.error("Acuity fetch failed: %s %s", resp.status_code, resp.text[:200])
+        except Exception as e:
+            log.error("Webhook processing error: %s", str(e))
+
+    return {"status": "processed", "action": action, "bucket": bucket, "id": apt_id}
 
 async def process_webhook_background(action: str, apt_id: str):
     """This runs AFTER the response is sent to Acuity"""
