@@ -212,7 +212,7 @@ async def caspio_upsert_appointment(appointment: dict):
         "patient_email":                   appointment.get("email", ""),
         "phone_number":                    appointment.get("phone", ""),
         "date_of_appointment":             appointment.get("date", ""),
-        "time_of_appointment":             appointment.get("datetime", ""),
+        "time_of_appointment":             appointment.get("time", ""),
         "ending_time_of_appointment":      appointment.get("endTime", ""),
         "calender_name":                   appointment.get("calendar", ""),
         "calendar_id":                     str(appointment.get("calendarID", "")),
@@ -233,6 +233,7 @@ async def caspio_upsert_appointment(appointment: dict):
         "price_sold":                      str(appointment.get("priceSold", "")),
         "client_time_zone":                appointment.get("timezone", ""),
         "calendar_timezone":               appointment.get("calendarTimezone", ""),
+        "datetime_created":                appointment.get("dateCreated", ""),
     }
 
     async with httpx.AsyncClient(timeout=15) as client:
