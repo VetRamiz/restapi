@@ -1037,6 +1037,18 @@ async def availability_by_state(
         for slot in resp.json():
             if slot.get("slotsAvailable", 0) < 1:
                 continue
+
+            # Skip slots within 24 hours of now
+            try:
+                from datetime import timezone as tz
+                slot_time = datetime.fromisoformat(slot["time"])
+                if slot_time.tzinfo is None:
+                    slot_time = slot_time.replace(tzinfo=tz.utc)
+                now = datetime.now(tz.utc)
+                if (slot_time - now).total_seconds() < 108000:   # 108000 = 30 hours
+                    continue
+            except Exception:
+                pass   # if parsing fails, include the slot rather than drop it
             slot_key = (cal_id, slot["time"])
             if slot_key in seen_slots:
                 continue
