@@ -759,7 +759,7 @@ PSYPACT_COMPACT_STATES: set = {
     "New Hampshire", "New Jersey", "North Carolina", "North Dakota", "Ohio",
     "Oklahoma", "Pennsylvania", "Rhode Island", "South Carolina", "South Dakota",
     "Tennessee", "Utah", "Vermont", "Virginia", "Washington", "West Virginia",
-    "Wisconsin", "Wyoming",
+    "Wisconsin", "Wyoming", "Texas",
 }
 
 NON_PSYPACT_STATES: set = ALL_US_STATES - PSYPACT_COMPACT_STATES
