@@ -1045,7 +1045,7 @@ async def availability_by_state(
                 if slot_time.tzinfo is None:
                     slot_time = slot_time.replace(tzinfo=tz.utc)
                 now = datetime.now(tz.utc)
-                if (slot_time - now).total_seconds() < 108000:   # 108000 = 30 hours
+                if (slot_time - now).total_seconds() < 129600:   # 129600 = 36 hours
                     continue
             except Exception:
                 pass   # if parsing fails, include the slot rather than drop it
