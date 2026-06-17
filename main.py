@@ -6,7 +6,8 @@ import logging
 import random
 import re
 from collections import deque, defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Optional, List
 from urllib.parse import parse_qs
 
@@ -212,7 +213,7 @@ async def caspio_upsert_appointment(appointment: dict):
         "patient_email":                   appointment.get("email", ""),
         "phone_number":                    appointment.get("phone", ""),
         "date_of_appointment":             appointment.get("date", ""),
-        "time_of_appointment":             appointment.get("time", ""),
+        "time_of_appointment":             appointment.get("datetime", ""),
         "ending_time_of_appointment":      appointment.get("endTime", ""),
         "calender_name":                   appointment.get("calendar", ""),
         "calendar_id":                     str(appointment.get("calendarID", "")),
@@ -233,7 +234,6 @@ async def caspio_upsert_appointment(appointment: dict):
         "price_sold":                      str(appointment.get("priceSold", "")),
         "client_time_zone":                appointment.get("timezone", ""),
         "calendar_timezone":               appointment.get("calendarTimezone", ""),
-        "datetime_created":                appointment.get("dateCreated", ""),
     }
 
     async with httpx.AsyncClient(timeout=15) as client:
@@ -571,6 +571,7 @@ async def acuity_webhook(
     x_acuity_signature: Optional[str] = Header(None)
 ):
     raw_body = await request.body()
+    log.info("Webhook raw body: %s", raw_body[:300])
 
     if not verify_acuity_signature(raw_body, x_acuity_signature):
         raise HTTPException(401, "Invalid webhook signature")
@@ -593,39 +594,29 @@ async def acuity_webhook(
     if not apt_id:
         return {"status": "ignored", "reason": "no appointment id"}
 
-    # Normalize: treat all upsert-type actions as the same bucket
-    # so "scheduled" + "order.completed" for the same apt_id = one write
-    CANCEL_ACTIONS = {"scheduling.canceled", "canceled"}
-    UPSERT_ACTIONS = {
-        "scheduling.scheduled", "scheduling.rescheduled",
-        "scheduling.changed", "order.completed",
-        "scheduled", "rescheduled", "changed",
-    }
-
-    if action in CANCEL_ACTIONS:
-        bucket = "cancel"
-    elif action in UPSERT_ACTIONS:
-        bucket = "upsert"
-    else:
-        return {"status": "ignored", "reason": f"unknown action {action}"}
-
-    # Dedup key is now apt_id + bucket, not apt_id + specific action
-    webhook_id = f"{bucket}_{apt_id}"
+    webhook_id = f"{action}_{apt_id}"
     if webhook_id in recent_webhooks:
-        log.info("Duplicate webhook ignored: %s (original action=%s)", webhook_id, action)
         return {"status": "duplicate ignored"}
     recent_webhooks.append(webhook_id)
 
-    log.info("Webhook received: action=%s bucket=%s id=%s", action, bucket, apt_id)
+    log.info("Webhook received: action=%s id=%s", action, apt_id)
 
-    if bucket == "cancel":
+    if action in ("scheduling.canceled", "canceled"):
         try:
             await caspio_mark_canceled(int(apt_id))
             log.info("Caspio mark canceled completed for ID: %s", apt_id)
         except Exception as e:
             log.error("Cancel failed: %s", e)
 
-    elif bucket == "upsert":
+    elif action in (
+        "scheduling.scheduled",
+        "scheduling.rescheduled",
+        "scheduling.changed",
+        "order.completed",
+        "scheduled",
+        "rescheduled",
+        "changed",
+    ):
         try:
             await asyncio.sleep(3)
             async with httpx.AsyncClient(timeout=10) as client:
@@ -636,6 +627,7 @@ async def acuity_webhook(
             log.info("Acuity fetch status: %s for ID: %s", resp.status_code, apt_id)
             if resp.status_code == 200:
                 appointment_data = resp.json()
+                log.info("Acuity appointment forms: %s", str(appointment_data.get("forms", [])))
                 await caspio_upsert_appointment(appointment_data)
                 log.info("Caspio upsert completed for ID: %s", apt_id)
             else:
@@ -643,35 +635,7 @@ async def acuity_webhook(
         except Exception as e:
             log.error("Webhook processing error: %s", str(e))
 
-    return {"status": "processed", "action": action, "bucket": bucket, "id": apt_id}
-
-async def process_webhook_background(action: str, apt_id: str):
-    """This runs AFTER the response is sent to Acuity"""
-    log.info("Background: Processing %s for %s", action, apt_id)
-    
-    if action in ("scheduling.canceled", "canceled"):
-        try:
-            await caspio_mark_canceled(int(apt_id))
-        except Exception as e:
-            log.error("Cancel failed: %s", e)
-            
-    elif action in (
-        "scheduling.scheduled", "scheduling.rescheduled",
-        "scheduling.changed", "order.completed",
-        "scheduled", "rescheduled", "changed",
-    ):
-        try:
-            await asyncio.sleep(3)
-            async with httpx.AsyncClient(timeout=10) as client:
-                resp = await client.get(
-                    f"{ACUITY_BASE}/appointments/{apt_id}",
-                    headers=acuity_headers()
-                )
-            if resp.status_code == 200:
-                await caspio_upsert_appointment(resp.json())
-                log.info("Background: Completed for %s", apt_id)
-        except Exception as e:
-            log.error("Background: Failed for %s: %s", apt_id, e)
+    return {"status": "processed", "action": action, "id": apt_id}
 
 
 # ==================================================
@@ -716,7 +680,7 @@ async def process_webhook_background(action: str, apt_id: str):
 # =============================================================================
 
 PSYCH_EVAL_CATEGORY_KEYWORD  = "PSYCHOLOGICAL EVALUATION"
-FERTILITY_NAME_KEYWORD       = "FERTILITY ONLINE"   # all target types contain this
+FERTILITY_NAME_KEYWORD       = "FERTILITY"   # all target types contain this
 
 # Test type IDs — always excluded regardless of name/category.
 # Legacy hard-coded IDs kept for safety; name-prefix detection handles new ones.
@@ -759,7 +723,7 @@ PSYPACT_COMPACT_STATES: set = {
     "New Hampshire", "New Jersey", "North Carolina", "North Dakota", "Ohio",
     "Oklahoma", "Pennsylvania", "Rhode Island", "South Carolina", "South Dakota",
     "Tennessee", "Utah", "Vermont", "Virginia", "Washington", "West Virginia",
-    "Wisconsin", "Wyoming", "Texas",
+    "Wisconsin", "Wyoming",
 }
 
 NON_PSYPACT_STATES: set = ALL_US_STATES - PSYPACT_COMPACT_STATES
@@ -1030,6 +994,34 @@ async def availability_by_state(
     therapist_slots: dict = {}
     seen_slots: set       = set()
 
+    # ── EARLIEST BOOKABLE CUTOFF ─────────────────────────────────────────────
+    # Deterministic calendar-day rule: block today AND tomorrow, allow day+2
+    # onward. Computed in Eastern time (practice home timezone) so the cutoff
+    # is the same regardless of which state/timezone the request is for.
+    #
+    # NOTE: this replaces a sliding "36 hours from now" window — that approach
+    # was rejected because depending on time-of-day it can still allow some
+    # evening slots on "tomorrow" to leak through, which doesn't match the
+    # hard requirement of "must start on day+2".
+    _now_eastern     = datetime.now(ZoneInfo("America/New_York"))
+    _cutoff_date     = (_now_eastern + timedelta(days=2)).date()
+    EARLIEST_BOOKABLE = datetime.combine(
+        _cutoff_date, datetime.min.time(), tzinfo=ZoneInfo("America/New_York")
+    )
+    log.info("availability/by-state earliest bookable cutoff = %s", EARLIEST_BOOKABLE.isoformat())
+
+    def _parse_acuity_iso(iso_str: str):
+        """
+        Acuity sends offsets WITHOUT a colon, e.g. '2026-06-18T16:00:00-0400'.
+        datetime.fromisoformat() on Python <3.11 cannot parse that and raises —
+        normalize to '-04:00' first so parsing never silently fails.
+        """
+        fixed = re.sub(r'([+-])(\d{2})(\d{2})$', r'\1\2:\3', iso_str)
+        dt = datetime.fromisoformat(fixed)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+
     for i, resp in enumerate(responses):
         cal_id, info = task_meta[i]
         if isinstance(resp, Exception) or resp.status_code != 200:
@@ -1038,17 +1030,17 @@ async def availability_by_state(
             if slot.get("slotsAvailable", 0) < 1:
                 continue
 
-            # Skip slots within 24 hours of now
+            # Cutoff check — exclude on parse failure (safer than including
+            # an un-vetted slot; the old "except: pass" was the actual bug).
             try:
-                from datetime import timezone as tz
-                slot_time = datetime.fromisoformat(slot["time"])
-                if slot_time.tzinfo is None:
-                    slot_time = slot_time.replace(tzinfo=tz.utc)
-                now = datetime.now(tz.utc)
-                if (slot_time - now).total_seconds() < 129600:   # 129600 = 36 hours
-                    continue
-            except Exception:
-                pass   # if parsing fails, include the slot rather than drop it
+                slot_time = _parse_acuity_iso(slot["time"])
+            except Exception as e:
+                log.warning("Could not parse slot time %r — excluding for safety: %s",
+                            slot.get("time"), e)
+                continue
+            if slot_time < EARLIEST_BOOKABLE:
+                continue
+
             slot_key = (cal_id, slot["time"])
             if slot_key in seen_slots:
                 continue
