@@ -682,6 +682,15 @@ async def acuity_webhook(
 PSYCH_EVAL_CATEGORY_KEYWORD  = "PSYCHOLOGICAL EVALUATION"
 FERTILITY_NAME_KEYWORD       = "FERTILITY"   # all target types contain this
 
+# Names containing these words are NEVER evaluation appointments, even if
+# they happen to carry "PSYCHOLOGICAL EVALUATION" in their category (data
+# entry mistakes on the Acuity side) and "FERTILITY" in their name.
+# Example seen in production: "Thrive: 15 Minute Fertility Therapy Matching -
+# Phone (Jorge Mora & Maria Llerena)" — a matching/intro call, not an eval.
+EXCLUDED_NAME_KEYWORDS: set = {
+    "MATCHING", "INTRO CALL", "CONSULTATION CALL", "PHONE CALL",
+}
+
 # Test type IDs — always excluded regardless of name/category.
 # Legacy hard-coded IDs kept for safety; name-prefix detection handles new ones.
 TEST_TYPE_IDS: set = {
@@ -765,6 +774,8 @@ def _is_eligible(apt_type: dict) -> bool:
       - have "PSYCHOLOGICAL EVALUATION" in its category
       - have "FERTILITY" in its name  ← locks out old 50-min non-fertility
         psych evals that share the same category but are NOT target types
+      - NOT contain an excluded keyword (matching calls, intro calls, etc.)
+        even if category/name otherwise look eligible
       - NOT be a test type
       - have at least one calendar ID (after overrides)
     """
@@ -773,6 +784,10 @@ def _is_eligible(apt_type: dict) -> bool:
     if PSYCH_EVAL_CATEGORY_KEYWORD not in cat:
         return False
     if FERTILITY_NAME_KEYWORD not in name:          # ← the key gate
+        return False
+    if any(kw in name for kw in EXCLUDED_NAME_KEYWORDS):   # ← matching-call guard
+        log.info("Excluded non-eval type id=%s name=%r (matched excluded keyword)",
+                  apt_type.get("id"), apt_type.get("name"))
         return False
     if _is_test_type(apt_type):
         return False
