@@ -769,7 +769,7 @@ FERTILITY_NAME_KEYWORD       = "FERTILITY ONLINE"   # all target types contain t
 # Test type IDs — always excluded regardless of name/category.
 # Legacy hard-coded IDs kept for safety; name-prefix detection handles new ones.
 TEST_TYPE_IDS: set = {
-    90824033, 90822425, 90822613, 90822881, 90826017, 90827405,
+    90824033, 90822425, 90822613, 90822881, 90827405,
 }
 
 
