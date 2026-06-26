@@ -169,6 +169,7 @@ def extract_referral_id(appointment: dict) -> Optional[str]:
     return None
 
 
+
 # --------------------------------------------------
 # CLINIC ID HELPER
 # --------------------------------------------------
@@ -184,6 +185,51 @@ def extract_clinic_id(appointment: dict) -> Optional[str]:
                 if val and len(val) < 100 and "\n" not in val:
                     return val
     return None
+
+def _parse_acuity_date(date_str: str) -> str:
+    """
+    Acuity sends 'date' as a human-readable string, e.g. 'May 6, 2026'.
+    If date_of_appointment is typed as Date/Time in Caspio (rather than
+    Text), sending this raw format risks Caspio failing to parse it —
+    and we've already seen a single bad field reject the ENTIRE write
+    (the referral_id constraint earlier caused a full 400, not just a
+    null field). Converting to ISO 'YYYY-MM-DD' here makes the value
+    safe regardless of which field type Caspio has configured.
+    Falls back to the raw string if parsing fails, so nothing is lost.
+    """
+    try:
+        dt = datetime.strptime(date_str.strip(), "%B %d, %Y")
+        return dt.strftime("%Y-%m-%d")
+    except Exception as e:
+        log.warning("Could not parse Acuity date %r: %s", date_str, e)
+        return date_str
+ 
+ 
+def _combine_date_time(date_str: str, time_str: str) -> str:
+    """
+    Acuity sends 'date' and 'time' as two SEPARATE plain strings, e.g.
+    date='May 6, 2026', time='4:00pm'. Sending either one alone to a
+    Caspio Date/Time field forces Caspio to guess the missing half —
+    and it defaults the missing date to TODAY (the date the record was
+    written), not the actual appointment date. That's the exact bug:
+    hours/minutes correct, date = record-stamp date.
+ 
+    This combines both into one unambiguous literal string Caspio can
+    store verbatim with no guessing and no timezone math:
+    'May 6, 2026' + '4:00pm' → '2026-05-06 16:00:00'
+ 
+    Falls back to the raw time string if parsing fails, so nothing is
+    ever silently dropped.
+    """
+    if not date_str or not time_str:
+        return time_str or date_str or ""
+    try:
+        combined = f"{date_str} {time_str}"
+        dt = datetime.strptime(combined, "%B %d, %Y %I:%M%p")
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception as e:
+        log.warning("Could not combine date+time %r + %r: %s", date_str, time_str, e)
+        return time_str
 
 
 # --------------------------------------------------
@@ -211,9 +257,11 @@ async def caspio_upsert_appointment(appointment: dict):
         "patient_second_name":             appointment.get("lastName", ""),
         "patient_email":                   appointment.get("email", ""),
         "phone_number":                    appointment.get("phone", ""),
-        "date_of_appointment":             appointment.get("date", ""),
-        "time_of_appointment":             appointment.get("time", ""),
-        "ending_time_of_appointment":      appointment.get("endTime", ""),
+        "date_of_appointment":             _parse_acuity_date(appointment.get("date", "")),
+        "time_of_appointment":             _combine_date_time(appointment.get("date", ""),
+                                                        appointment.get("time", "")),
+        "ending_time_of_appointment":      _combine_date_time(appointment.get("date", ""),
+                                                        appointment.get("endTime", "")),
         "calender_name":                   appointment.get("calendar", ""),
         "calendar_id":                     str(appointment.get("calendarID", "")),
         "appointment_type":                appointment.get("type", ""),
